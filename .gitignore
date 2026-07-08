@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Streamlit cache
+.streamlit/
+
+# Python env
+.env
+*.env
+
+# Database secrets
+*.pem
+*.key
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temporary files
+tmp/
+temp/
+ls
+# Local data files
+raw_data/
+downloads/
+
+# Local configuration
+config/local*
