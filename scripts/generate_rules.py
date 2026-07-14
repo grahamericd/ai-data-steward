@@ -3,6 +3,7 @@ import json
 import subprocess
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 import sys
 
 # load_dotenv(os.path.expanduser("~/.datalab.env"))

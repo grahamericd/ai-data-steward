@@ -2,20 +2,26 @@ import os
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 import sys
 
-#load_dotenv(os.path.expanduser("~/.datalab.env"))
+load_dotenv()
 
-#engine = create_engine(
-#    f"postgresql+psycopg2://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}"
-#)
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+
 
 engine = create_engine(
-    "postgresql://egraham@localhost/florida_data_lab",
-    connect_args={
-        "password": "P@ssw0rd12345"
-    }
-)
+    URL.create(
+        "postgresql+psycopg2",
+        username=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        database=DB_NAME,
+    )
+ )
 
 
 def get_dataset_config(conn, dataset_name):

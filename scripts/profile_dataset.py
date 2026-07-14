@@ -1,6 +1,6 @@
 import pandas as pd
 from sqlalchemy import create_engine, text
-#from sqlalchemy import text
+from sqlalchemy.engine import URL
 from dotenv import load_dotenv
 import os
 import json
@@ -8,23 +8,24 @@ import re
 import sys
 
 
-#load_dotenv(os.path.expanduser("~/.datalab.env"))
+load_dotenv()
 
-#DB_USER = 'egraham'
-#DB_PASSWORD = 'P@ssw0rd12345'
-#DB_HOST = 'localhost'
-#DB_NAME = 'florida_data_lab'
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
 
-#engine = create_engine(
-#   f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
-#)
 
 engine = create_engine(
-    "postgresql://egraham@localhost/florida_data_lab",
-    connect_args={
-        "password": "P@ssw0rd12345"
-    }
-)
+    URL.create(
+        "postgresql+psycopg2",
+        username=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        database=DB_NAME,
+    )
+ )
+    
 
 def infer_type(series):
     sample = series.dropna().astype(str)

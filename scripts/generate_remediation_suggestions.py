@@ -3,25 +3,27 @@ import json
 import re
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 
 
-#load_dotenv(os.path.expanduser("~/.datalab.env"))
 
-#DB_USER = os.getenv("DB_USER")
-#DB_PASSWORD = os.getenv("DB_PASSWORD")
-#DB_HOST = os.getenv("DB_HOST", "localhost")
-#DB_NAME = os.getenv("DB_NAME", "florida_data_lab")
+load_dotenv()
 
-#engine = create_engine(
-#   f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
-#)
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+
 
 engine = create_engine(
-    "postgresql://egraham@localhost/florida_data_lab",
-    connect_args={
-        "password": "P@ssw0rd12345"
-    }
-)
+    URL.create(
+        "postgresql+psycopg2",
+        username=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        database=DB_NAME,
+    )
+ )
 
 STATE_CODES = (
     "AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|"
