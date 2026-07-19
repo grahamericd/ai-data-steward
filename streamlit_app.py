@@ -1,29 +1,17 @@
 import os
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+import sys
+from pathlib import Path
+from sqlalchemy import text
 from sqlalchemy.engine import URL
 import subprocess
 
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-
-
-engine = create_engine(
-    URL.create(
-        "postgresql+psycopg2",
-        username=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        database=DB_NAME,
-    )
- )
-
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    
+from config import RAW_DATA_DIR, engine
 
 st.set_page_config(page_title="Data Quality Lab", layout="wide")
 
@@ -37,14 +25,7 @@ page = st.sidebar.radio(
 def read_sql(query, params=None):
     return pd.read_sql(text(query), engine, params=params)
     
- # def get_datasets():
-    # df = read_sql("""
-        # SELECT DISTINCT dataset_name
-        # FROM metadata.column_profile
-        # ORDER BY dataset_name
-    # """)
-    # return df["dataset_name"].tolist()
-    
+     
 def get_datasets():
     df = read_sql("""
         SELECT  dataset_name
@@ -68,19 +49,7 @@ def run_script(script_name, *args):
 
     return result
     
-# def run_script(script_name):
-    # project_dir = os.path.expanduser("~/projects/data-lab")
-    # python_path = os.path.join(project_dir, ".venv/bin/python")
-    # script_path = os.path.join(project_dir, "scripts", script_name)
 
-    # result = subprocess.run(
-        # [python_path, script_path],
-        # cwd=project_dir,
-        # capture_output=True,
-        # text=True
-    # )
-
-    # return result
     
 if page == "Dashboard":
     st.header("Data Quality Dashboard")

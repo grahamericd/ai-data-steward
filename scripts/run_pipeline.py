@@ -1,9 +1,18 @@
 import os
 import sys
+from pathlib import Path
 import subprocess
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    
+from config import PROJECT_ROOT, SCRIPTS_DIR
 
-PROJECT_DIR = os.path.expanduser("~/projects/data-lab")
-PYTHON = os.path.join(PROJECT_DIR, ".venv/bin/python")
+PYTHON = sys.executable
+
+#PROJECT_DIR = os.path.expanduser("~/projects/data-lab")
+#PYTHON = os.path.join(PROJECT_DIR, ".venv/bin/python")
+
 
 PIPELINE_STEPS = [
     ("Load Dataset", "load_dataset.py"),
@@ -15,16 +24,17 @@ PIPELINE_STEPS = [
 
 
 def run_step(step_name, script_name, dataset_name):
-    script_path = os.path.join(PROJECT_DIR, "scripts", script_name)
+    #script_path = os.path.join(PROJECT_DIR, "scripts", script_name)
+    script_path = SCRIPTS_DIR / script_name
 
     print(f"\n=== {step_name} ===")
 
     result = subprocess.run(
-        [PYTHON, script_path, dataset_name],
-        cwd=PROJECT_DIR,
+        [PYTHON, str(script_path), dataset_name],
+        cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
-    )
+)
 
     print(result.stdout)
 

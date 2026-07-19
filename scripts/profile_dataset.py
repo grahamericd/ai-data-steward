@@ -1,30 +1,17 @@
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import URL
-from dotenv import load_dotenv
 import os
 import json
 import re
 import sys
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    
+from config import RAW_DATA_DIR, engine
 
-
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-
-
-engine = create_engine(
-    URL.create(
-        "postgresql+psycopg2",
-        username=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        database=DB_NAME,
-    )
- )
     
 
 def infer_type(series):

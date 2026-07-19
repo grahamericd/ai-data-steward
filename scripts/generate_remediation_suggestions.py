@@ -1,29 +1,17 @@
 import os
 import json
 import re
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from pathlib import Path
+import sys
+from sqlalchemy import text
 from sqlalchemy.engine import URL
 
 
-
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-
-
-engine = create_engine(
-    URL.create(
-        "postgresql+psycopg2",
-        username=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        database=DB_NAME,
-    )
- )
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    
+from config import RAW_DATA_DIR, engine
 
 STATE_CODES = (
     "AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|"

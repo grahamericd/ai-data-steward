@@ -1,118 +1,171 @@
-import os
-import sys
 import json
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
+import sys
+from pathlib import Path
 
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
+from sqlalchemy import text
 
 
-engine = create_engine(
-    URL.create(
-        "postgresql+psycopg2",
-        username=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        database=DB_NAME,
-    )
- )
+# Make the project root importable.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-if len(sys.argv) != 2:
-    print("Usage: python apply_remediations.py <dataset_name>")
-    sys.exit(1)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-dataset_name = sys.argv[1]
+from config import engine
 
-with engine.begin() as conn:
-    dataset = conn.execute(
+
+def get_dataset(conn, dataset_name):
+    return conn.execute(
         text("""
             SELECT *
             FROM metadata.dataset
             WHERE dataset_name = :dataset_name
               AND active = TRUE
         """),
-        {"dataset_name": dataset_name}
+        {"dataset_name": dataset_name},
     ).mappings().first()
 
-    if not dataset:
-        raise ValueError(f"Dataset not found: {dataset_name}")
 
-    raw_schema = dataset["raw_schema"]
-    raw_table = dataset["raw_table"]
-    primary_key = dataset["primary_key"]
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python apply_remediations.py <dataset_name>")
+        sys.exit(1)
 
-    if not primary_key:
-        raise ValueError("Dataset must have a primary_key to apply remediations.")
+    dataset_name = sys.argv[1]
 
-    curated_table = raw_table
+    with engine.begin() as conn:
+        dataset = get_dataset(conn, dataset_name)
 
-    print(f"Creating curated.{curated_table} from {raw_schema}.{raw_table}")
-
-    conn.execute(text(f'DROP TABLE IF EXISTS curated."{curated_table}"'))
-
-    conn.execute(text(f"""
-        CREATE TABLE curated."{curated_table}" AS
-        SELECT *
-        FROM {raw_schema}."{raw_table}"
-    """))
-
-    remediations = conn.execute(
-        text("""
-            SELECT *
-            FROM dq.remediation_suggestion
-            WHERE dataset_name = :dataset_name
-              AND status = 'approved'
-            ORDER BY id
-        """),
-        {"dataset_name": dataset_name}
-    ).mappings().all()
-
-    print(f"Approved remediations found: {len(remediations)}")
-
-    applied = 0
-
-    for remediation in remediations:
-        pk_value = remediation["source_row_identifier"]
-        suggested_values = remediation["suggested_values"]
-
-        if isinstance(suggested_values, str):
-            suggested_values = json.loads(suggested_values)
-
-        updates = {
-            k: v
-            for k, v in suggested_values.items()
-            if k not in [primary_key]
-        }
-
-        for column_name, new_value in updates.items():
-            conn.execute(
-                text(f"""
-                    UPDATE curated."{curated_table}"
-                    SET "{column_name}" = :new_value
-                    WHERE "{primary_key}" = :pk_value
-                """),
-                {
-                    "new_value": new_value,
-                    "pk_value": pk_value
-                }
+        if not dataset:
+            raise ValueError(
+                f"Dataset not found or inactive: {dataset_name}"
             )
 
-        conn.execute(
-            text("""
-                UPDATE dq.remediation_suggestion
-                SET status = 'applied'
-                WHERE id = :id
-            """),
-            {"id": remediation["id"]}
+        raw_schema = dataset["raw_schema"]
+        raw_table = dataset["raw_table"]
+        primary_key = dataset["primary_key"]
+
+        if not primary_key:
+            raise ValueError(
+                f"Dataset '{dataset_name}' must have a primary key "
+                "before remediations can be applied."
+            )
+
+        curated_table = raw_table
+
+        print(
+            f"Creating curated.{curated_table} "
+            f"from {raw_schema}.{raw_table}"
         )
 
-        applied += 1
+        conn.execute(
+            text(f'DROP TABLE IF EXISTS curated."{curated_table}"')
+        )
 
-    print(f"Remediations applied: {applied}")
-    print(f"Curated table ready: curated.{curated_table}")
+        conn.execute(
+            text(f"""
+                CREATE TABLE curated."{curated_table}" AS
+                SELECT *
+                FROM "{raw_schema}"."{raw_table}"
+            """)
+        )
+
+        remediations = conn.execute(
+            text("""
+                SELECT *
+                FROM dq.remediation_suggestion
+                WHERE dataset_name = :dataset_name
+                  AND status = 'approved'
+                ORDER BY id
+            """),
+            {"dataset_name": dataset_name},
+        ).mappings().all()
+
+        print(f"Approved remediations found: {len(remediations)}")
+
+        applied = 0
+        skipped = 0
+
+        for remediation in remediations:
+            remediation_id = remediation["id"]
+            pk_value = remediation["source_row_identifier"]
+            suggested_values = remediation["suggested_values"]
+
+            if not pk_value:
+                print(
+                    f"Skipping remediation {remediation_id}: "
+                    "missing source row identifier."
+                )
+                skipped += 1
+                continue
+
+            if isinstance(suggested_values, str):
+                suggested_values = json.loads(suggested_values)
+
+            if not isinstance(suggested_values, dict):
+                print(
+                    f"Skipping remediation {remediation_id}: "
+                    "suggested_values is not a JSON object."
+                )
+                skipped += 1
+                continue
+
+            updates = {
+                column_name: new_value
+                for column_name, new_value in suggested_values.items()
+                if column_name != primary_key
+            }
+
+            if not updates:
+                print(
+                    f"Skipping remediation {remediation_id}: "
+                    "no suggested field updates."
+                )
+                skipped += 1
+                continue
+
+            row_updated = False
+
+            for column_name, new_value in updates.items():
+                result = conn.execute(
+                    text(f"""
+                        UPDATE curated."{curated_table}"
+                        SET "{column_name}" = :new_value
+                        WHERE "{primary_key}" = :pk_value
+                    """),
+                    {
+                        "new_value": new_value,
+                        "pk_value": pk_value,
+                    },
+                )
+
+                if result.rowcount > 0:
+                    row_updated = True
+
+            if not row_updated:
+                print(
+                    f"Skipping remediation {remediation_id}: "
+                    f"no curated record matched "
+                    f"{primary_key}={pk_value!r}."
+                )
+                skipped += 1
+                continue
+
+            conn.execute(
+                text("""
+                    UPDATE dq.remediation_suggestion
+                    SET status = 'applied'
+                    WHERE id = :id
+                """),
+                {"id": remediation_id},
+            )
+
+            applied += 1
+
+        print(f"Remediations applied: {applied}")
+        print(f"Remediations skipped: {skipped}")
+        print(f"Curated table ready: curated.{curated_table}")
+
+
+if __name__ == "__main__":
+    main()
