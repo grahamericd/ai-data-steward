@@ -1,81 +1,29 @@
-# AI Data Steward
+AI Data Steward
 
-AI Data Steward is an AI-assisted data governance platform that automates data profiling, data quality rule generation, rule evaluation, remediation suggestions, and human-in-the-loop data stewardship.
+An AI-assisted data stewardship platform for managing data quality,
+metadata, lineage, and remediation through a human-in-the-loop workflow.
 
-## Features
+Features
 
-- Metadata-driven dataset registration
-- Fixed-width and CSV dataset support
-- Automatic data profiling
-- LLM-generated business definitions and quality rules
-- Rule guardrails
-- Human approval workflow
-- Data quality evaluation
-- Remediation suggestion generation
-- Curated data creation
-- Streamlit web interface
-- Dataset 360 dashboard
-- Steward Workbench
+• Metadata-driven ingestion
+• CSV and fixed-width parsing
+• Incremental loading
+• Data profiling
+• AI-generated quality rules
+• Rule approval workflow
+• Quality evaluation
+• AI remediation suggestions
+• Curated data generation
+• Dataset health monitoring
+• Load history
+• Row-level lineage
+• Streamlit web application
 
-## Architecture
+Technology
 
-```
-Register Dataset
-        │
-        ▼
-Load Dataset
-        │
-        ▼
-Profile Dataset
-        │
-        ▼
-LLM Rule Generation
-        │
-        ▼
-Rule Approval
-        │
-        ▼
-Rule Evaluation
-        │
-        ▼
-Remediation Suggestions
-        │
-        ▼
-Remediation Approval
-        │
-        ▼
-Curated Dataset
-```
-
-## Technology
-
-- Python
-- PostgreSQL
-- SQLAlchemy
-- Streamlit
-- Ollama (Llama)
-- Pandas
-
-## Project Structure
-
-```
-scripts/
-streamlit_app.py
-metadata/
-docs/
-sql/
-```
-
-## Running
-
-Start the Streamlit application:
-
-```bash
-streamlit run streamlit_app.py
-```
-
-Register a dataset and execute the entire stewardship workflow directly from the application.
-
-## Status
-
-Current Version: **1.0.0**
+Python
+PostgreSQL
+Streamlit
+Ollama
+SQLAlchemy
+Pandas

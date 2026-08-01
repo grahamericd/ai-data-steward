@@ -8,6 +8,7 @@ from sqlalchemy.engine import URL
 import subprocess
 import tempfile
 import json
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -181,7 +182,42 @@ def run_script(script_name, *args):
 
     return result
     
+def format_last_loaded(timestamp_value):
+    """
+    Format a database timestamp for the Dataset 360 health banner.
+    """
 
+    if timestamp_value is None or pd.isna(timestamp_value):
+        return "Never"
+
+    timestamp = pd.Timestamp(timestamp_value)
+
+    # PostgreSQL timestamps may already contain timezone information.
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+
+    local_timestamp = timestamp.tz_convert(
+        ZoneInfo("America/New_York")
+    )
+
+    now = pd.Timestamp.now(
+        tz=ZoneInfo("America/New_York")
+    )
+
+    time_text = local_timestamp.strftime("%-I:%M %p")
+
+    if local_timestamp.date() == now.date():
+        return f"Today {time_text}"
+
+    if (
+        local_timestamp.date()
+        == (now - pd.Timedelta(days=1)).date()
+    ):
+        return f"Yesterday {time_text}"
+
+    return local_timestamp.strftime(
+        "%b %-d, %Y %-I:%M %p"
+    )
     
 if page == "Dashboard":
     st.header("Data Quality Dashboard")
@@ -999,35 +1035,289 @@ elif page == "Dataset 360":
 
         st.subheader(dataset_row["display_name"] or dataset_name)
 
-        col1, col2, col3, col4 = st.columns(4)
+        # -------------------------------------------------------------
+        # Dataset health status
+        # -------------------------------------------------------------
 
-        row_count = read_sql(f"""
+        raw_schema = dataset_row["raw_schema"]
+        raw_table = dataset_row["raw_table"]
+
+        row_count = read_sql(
+            f"""
             SELECT COUNT(*) AS row_count
-            FROM {dataset_row["raw_schema"]}.{dataset_row["raw_table"]}
-        """)
+            FROM "{raw_schema}"."{raw_table}"
+            """
+        )
 
-        column_count = read_sql("""
-            SELECT COUNT(*) AS column_count
-            FROM metadata.column_profile
-            WHERE dataset_name = :dataset_name
-        """, {"dataset_name": dataset_name})
+        total_rows = int(
+            row_count.loc[0, "row_count"] or 0
+        )
 
-        rule_count = read_sql("""
-            SELECT COUNT(*) AS rule_count
+        approved_rule_count = read_sql(
+            """
+            SELECT COUNT(*) AS approved_rules
             FROM dq.rule
             WHERE dataset_name = :dataset_name
-        """, {"dataset_name": dataset_name})
+              AND status = 'approved'
+            """,
+            {
+                "dataset_name": dataset_name,
+            },
+        )
 
-        remediation_count = read_sql("""
-            SELECT COUNT(*) AS remediation_count
+        approved_rules = int(
+            approved_rule_count.loc[
+                0,
+                "approved_rules"
+            ]
+            or 0
+        )
+
+        pending_remediation_count = read_sql(
+            """
+            SELECT COUNT(*) AS pending_remediations
             FROM dq.remediation_suggestion
             WHERE dataset_name = :dataset_name
-        """, {"dataset_name": dataset_name})
+              AND status = 'proposed'
+            """,
+            {
+                "dataset_name": dataset_name,
+            },
+        )
 
-        col1.metric("Rows", int(row_count.loc[0, "row_count"]))
-        col2.metric("Columns", int(column_count.loc[0, "column_count"]))
-        col3.metric("Rules", int(rule_count.loc[0, "rule_count"]))
-        col4.metric("Remediations", int(remediation_count.loc[0, "remediation_count"]))
+        pending_remediations = int(
+            pending_remediation_count.loc[
+                0,
+                "pending_remediations"
+            ]
+            or 0
+        )
+
+        last_load = read_sql(
+            """
+            SELECT
+                load_run_id,
+                completed_at,
+                source_file,
+                rows_received,
+                rows_inserted,
+                rows_updated
+            FROM metadata.load_run
+            WHERE dataset_name = :dataset_name
+              AND status = 'completed'
+            ORDER BY completed_at DESC
+            LIMIT 1
+            """,
+            {
+                "dataset_name": dataset_name,
+            },
+        )
+
+        if last_load.empty:
+            last_loaded_text = "Never"
+            last_load_run_id = None
+        else:
+            last_loaded_text = format_last_loaded(
+                last_load.loc[0, "completed_at"]
+            )
+
+            last_load_run_id = int(
+                last_load.loc[0, "load_run_id"]
+            )
+
+        # Use only the latest result for each approved rule.
+        latest_quality_results = read_sql(
+            """
+            WITH latest_results AS
+            (
+                SELECT DISTINCT ON (r.rule_id)
+                    r.rule_id,
+                    r.result_status,
+                    r.checked_at
+                FROM dq.result r
+                INNER JOIN dq.rule ru
+                    ON ru.id = r.rule_id
+                WHERE r.dataset_name = :dataset_name
+                  AND ru.status = 'approved'
+                  AND r.result_status IN ('PASS', 'FAIL')
+                ORDER BY
+                    r.rule_id,
+                    r.checked_at DESC
+            )
+            SELECT
+                COUNT(*) AS evaluated_rules,
+                SUM(
+                    CASE
+                        WHEN result_status = 'PASS'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS passed_rules,
+                SUM(
+                    CASE
+                        WHEN result_status = 'FAIL'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS failed_rules
+            FROM latest_results
+            """,
+            {
+                "dataset_name": dataset_name,
+            },
+        )
+
+        evaluated_rules = int(
+            latest_quality_results.loc[
+                0,
+                "evaluated_rules"
+            ]
+            or 0
+        )
+
+        passed_rules = int(
+            latest_quality_results.loc[
+                0,
+                "passed_rules"
+            ]
+            or 0
+        )
+
+        failed_rules = int(
+            latest_quality_results.loc[
+                0,
+                "failed_rules"
+            ]
+            or 0
+        )
+
+        if evaluated_rules > 0:
+            quality_score = round(
+                (
+                    passed_rules
+                    / evaluated_rules
+                )
+                * 100,
+                1,
+            )
+        else:
+            quality_score = None
+
+        # -------------------------------------------------------------
+        # Determine dataset health
+        # -------------------------------------------------------------
+
+        if last_load.empty:
+            health_label = "Not Loaded"
+            health_icon = "⚪"
+            health_message = (
+                "This dataset has not completed a recorded load."
+            )
+            health_display = st.info
+
+        elif quality_score is None:
+            health_label = "Not Yet Assessed"
+            health_icon = "🔵"
+            health_message = (
+                "The dataset is loaded, but its approved rules "
+                "have not been evaluated."
+            )
+            health_display = st.info
+
+        elif quality_score >= 95:
+            health_label = "Healthy"
+            health_icon = "🟢"
+            health_message = (
+                "The dataset is meeting its current approved "
+                "data-quality expectations."
+            )
+            health_display = st.success
+
+        elif quality_score >= 85:
+            health_label = "Needs Attention"
+            health_icon = "🟡"
+            health_message = (
+                "One or more approved quality rules are failing."
+            )
+            health_display = st.warning
+
+        else:
+            health_label = "At Risk"
+            health_icon = "🔴"
+            health_message = (
+                "The dataset has a significant number of failed "
+                "quality rules."
+            )
+            health_display = st.error
+
+        st.markdown("### Dataset Health")
+
+        health_display(
+            f"{health_icon} **{health_label}** — "
+            f"{health_message}"
+        )
+
+        health_col1, health_col2, health_col3, health_col4 = (
+            st.columns(4)
+        )
+
+        health_col1.metric(
+            "Quality Score",
+            (
+                f"{quality_score}%"
+                if quality_score is not None
+                else "Not assessed"
+            ),
+            help=(
+                "Percentage of the latest approved-rule "
+                "evaluations that passed."
+            ),
+        )
+
+        health_col2.metric(
+            "Last Loaded",
+            last_loaded_text,
+            help=(
+                f"Latest successful load run: "
+                f"{last_load_run_id or 'None'}"
+            ),
+        )
+
+        health_col3.metric(
+            "Rows",
+            f"{total_rows:,}",
+        )
+
+        health_col4.metric(
+            "Approved Rules",
+            f"{approved_rules:,}",
+        )
+
+        remediation_col1, remediation_col2, remediation_col3 = (
+            st.columns(3)
+        )
+
+        remediation_col1.metric(
+            "Pending Remediations",
+            f"{pending_remediations:,}",
+        )
+
+        remediation_col2.metric(
+            "Evaluated Rules",
+            f"{evaluated_rules:,}",
+        )
+
+        remediation_col3.metric(
+            "Failed Rules",
+            f"{failed_rules:,}",
+        )
+
+        if quality_score is not None:
+            st.progress(
+                quality_score / 100
+            )
+
+        st.divider()
 
         st.markdown("### Dataset Details")
         
