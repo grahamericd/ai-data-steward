@@ -6,6 +6,8 @@ from pathlib import Path
 from sqlalchemy import text
 from sqlalchemy.engine import URL
 import subprocess
+import tempfile
+import json
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -13,17 +15,147 @@ if str(PROJECT_ROOT) not in sys.path:
     
 from config import RAW_DATA_DIR, engine
 
+from scripts.load_dataset import (
+    load_dataset,
+    get_parser_definition,
+    parse_fixed_width_record,
+)
+
 st.set_page_config(page_title="Data Quality Lab", layout="wide")
 
 st.title("AI-Assisted Data Quality Lab")
 
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Register Dataset", "Dataset 360", "Steward Workbench", "Rule Catalog", "Failed Records", "Remediation Queue", "Raw Data Preview", "Run Pipeline"]
+    ["Dashboard", "Register Dataset", "Incremental Data Load","Dataset 360", "Steward Workbench", "Rule Catalog", "Failed Records", "Remediation Queue", "Raw Data Preview", "Run Pipeline"]
 )
 
 def read_sql(query, params=None):
     return pd.read_sql(text(query), engine, params=params)
+    
+def get_dataset_registration(dataset_name):
+    """
+    Return the active metadata registration for one dataset.
+    """
+
+    dataset = read_sql(
+        """
+        SELECT *
+        FROM metadata.dataset
+        WHERE dataset_name = :dataset_name
+          AND active = TRUE
+        """,
+        {
+            "dataset_name": dataset_name,
+        },
+    )
+
+    if dataset.empty:
+        return None
+
+    return dataset.iloc[0].to_dict()
+
+
+def preview_fixed_width_file(
+    dataset,
+    file_path,
+    max_rows=20,
+):
+    """
+    Parse a small preview of a registered fixed-width file.
+    """
+
+    with engine.begin() as conn:
+        fields = get_parser_definition(
+            conn,
+            dataset["dataset_id"],
+        )
+
+    if not fields:
+        raise ValueError(
+            "No fixed-width parser definition was found for "
+            f"dataset '{dataset['dataset_name']}'."
+        )
+
+    rows = []
+
+    with open(
+        file_path,
+        "r",
+        encoding="latin-1",
+        errors="replace",
+    ) as source:
+        for line in source:
+            line = line.rstrip("\r\n")
+
+            if not line.strip():
+                continue
+
+            rows.append(
+                parse_fixed_width_record(
+                    line,
+                    fields,
+                )
+            )
+
+            if len(rows) >= max_rows:
+                break
+
+    return pd.DataFrame(rows)
+
+
+def preview_uploaded_file(
+    dataset,
+    file_path,
+    max_rows=20,
+):
+    """
+    Preview a file using the dataset's registered source type.
+    """
+
+    source_type = dataset["source_type"]
+
+    if source_type == "csv":
+        return pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            low_memory=False,
+            nrows=max_rows,
+        )
+
+    if source_type == "fixed_width":
+        return preview_fixed_width_file(
+            dataset,
+            file_path,
+            max_rows=max_rows,
+        )
+
+    raise ValueError(
+        f"Preview is not supported for source type '{source_type}'."
+    )
+
+
+def save_uploaded_file_temporarily(uploaded_file):
+    """
+    Write a Streamlit upload to a temporary local file.
+    """
+
+    file_suffix = Path(
+        uploaded_file.name
+    ).suffix
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=file_suffix,
+    ) as temporary_file:
+        temporary_file.write(
+            uploaded_file.getbuffer()
+        )
+
+        return Path(
+            temporary_file.name
+        )
     
      
 def get_datasets():
@@ -99,6 +231,471 @@ if page == "Dashboard":
     """)
 
     st.dataframe(recent, use_container_width=True)
+    
+elif page == "Incremental Data Load":
+
+    st.header("Incremental Data Load")
+
+    st.write(
+        "Upload a new source file and load it into the dataset's "
+        "registered raw table."
+    )
+
+    datasets = get_datasets()
+
+    if not datasets:
+        st.warning(
+            "No active datasets are registered."
+        )
+        st.stop()
+
+    dataset_name = st.selectbox(
+        "Select Dataset",
+        datasets,
+        key="incremental_load_dataset",
+    )
+
+    dataset = get_dataset_registration(
+        dataset_name
+    )
+
+    if dataset is None:
+        st.error(
+            "The selected dataset could not be found in the registry."
+        )
+        st.stop()
+
+    source_type = dataset.get(
+        "source_type"
+    )
+
+    raw_schema = dataset.get(
+        "raw_schema"
+    )
+
+    raw_table = dataset.get(
+        "raw_table"
+    )
+
+    primary_key = dataset.get(
+        "primary_key"
+    )
+
+    registered_mode = (
+        dataset.get("load_mode")
+        or "upsert"
+    ).lower()
+
+    st.subheader("Dataset Configuration")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Source Type",
+        source_type or "Not configured",
+    )
+
+    col2.metric(
+        "Target Table",
+        f"{raw_schema}.{raw_table}",
+    )
+
+    col3.metric(
+        "Primary Key",
+        primary_key or "Not configured",
+    )
+
+    col4.metric(
+        "Default Load Mode",
+        registered_mode,
+    )
+
+    if dataset.get("description"):
+        st.info(
+            dataset["description"]
+        )
+
+    st.divider()
+
+    load_modes = [
+        "upsert",
+        "append",
+        "replace",
+    ]
+
+    if registered_mode in load_modes:
+        default_mode_index = load_modes.index(
+            registered_mode
+        )
+    else:
+        default_mode_index = 0
+
+    load_mode = st.selectbox(
+        "Load Mode",
+        load_modes,
+        index=default_mode_index,
+        help=(
+            "Upsert inserts new records and updates matching primary "
+            "keys. Append adds every incoming row. Replace rebuilds "
+            "the complete raw table."
+        ),
+    )
+
+    if load_mode == "upsert" and not primary_key:
+        st.error(
+            "This dataset does not have a primary key configured. "
+            "Upsert mode cannot be used."
+        )
+
+    if load_mode == "replace":
+        st.warning(
+            "Replace mode will delete and rebuild the existing raw table."
+        )
+
+    uploaded_file = st.file_uploader(
+        "Choose Source File",
+        key="incremental_source_file",
+        help=(
+            "The file will be parsed according to the dataset's "
+            "registered source type and parser definition."
+        ),
+    )
+
+    if uploaded_file is not None:
+
+        file_col1, file_col2 = st.columns(2)
+
+        file_col1.metric(
+            "File Name",
+            uploaded_file.name,
+        )
+
+        file_col2.metric(
+            "File Size",
+            f"{uploaded_file.size:,} bytes",
+        )
+
+        st.subheader("Parsed File Preview")
+
+        preview_path = None
+
+        try:
+            preview_path = save_uploaded_file_temporarily(
+                uploaded_file
+            )
+
+            preview = preview_uploaded_file(
+                dataset,
+                preview_path,
+                max_rows=20,
+            )
+
+            st.dataframe(
+                preview,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            preview_col1, preview_col2 = st.columns(2)
+
+            preview_col1.metric(
+                "Preview Rows",
+                len(preview),
+            )
+
+            preview_col2.metric(
+                "Detected Columns",
+                len(preview.columns),
+            )
+
+            with st.expander(
+                "Detected Column Names"
+            ):
+                st.write(
+                    preview.columns.tolist()
+                )
+
+        except Exception as exc:
+            st.error(
+                f"Unable to preview the uploaded file: {exc}"
+            )
+
+        finally:
+            if (
+                preview_path is not None
+                and preview_path.exists()
+            ):
+                preview_path.unlink(
+                    missing_ok=True
+                )
+
+    st.divider()
+
+    load_is_disabled = (
+        uploaded_file is None
+        or (
+            load_mode == "upsert"
+            and not primary_key
+        )
+    )
+
+    if st.button(
+        "Load File",
+        type="primary",
+        use_container_width=True,
+        disabled=load_is_disabled,
+    ):
+
+        load_path = None
+
+        try:
+            load_path = save_uploaded_file_temporarily(
+                uploaded_file
+            )
+
+            with st.spinner(
+                "Parsing and loading the source file..."
+            ):
+                result = load_dataset(
+                    dataset_name=dataset_name,
+                    supplied_file=str(
+                        load_path
+                    ),
+                    requested_mode=load_mode,
+                    source_file_label=uploaded_file.name,
+                    initiated_by="streamlit_user",
+                )
+
+            st.success(
+                "The source file loaded successfully."
+            )
+
+            result_col1, result_col2, result_col3 = st.columns(
+                3
+            )
+
+            result_col1.metric(
+                "Rows Received",
+                result.get(
+                    "rows_received",
+                    0,
+                ),
+            )
+
+            result_col2.metric(
+                "Rows Inserted",
+                result.get(
+                    "rows_inserted",
+                    0,
+                ),
+            )
+
+            result_col3.metric(
+                "Rows Updated",
+                result.get(
+                    "rows_updated",
+                    0,
+                ),
+            )
+
+            st.subheader("Load Summary")
+
+            summary = pd.DataFrame(
+                [
+                    {
+                        "Dataset": result.get(
+                            "dataset_name"
+                        ),
+                        "Source File": uploaded_file.name,
+                        "Source Type": result.get(
+                            "source_type"
+                        ),
+                        "Load Mode": result.get(
+                            "load_mode"
+                        ),
+                        "Primary Key": result.get(
+                            "primary_key"
+                        ),
+                        "Target Table": result.get(
+                            "target_table"
+                        ),
+                        "Status": result.get(
+                            "status"
+                        ),
+                    }
+                ]
+            )
+
+            st.dataframe(
+                summary,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander(
+                "Technical Load Details"
+            ):
+                st.json(
+                    result
+                )
+
+        except Exception as exc:
+            st.error(
+                f"Load failed: {exc}"
+            )
+
+        finally:
+            if (
+                load_path is not None
+                and load_path.exists()
+            ):
+                load_path.unlink(
+                    missing_ok=True
+                )
+                
+        st.divider()
+    st.subheader("Recent Load History")
+
+    history_scope = st.radio(
+        "History Scope",
+        [
+            "Selected Dataset",
+            "All Datasets",
+        ],
+        horizontal=True,
+        key="load_history_scope",
+    )
+
+    try:
+        if history_scope == "Selected Dataset":
+            load_history = read_sql(
+                """
+                SELECT
+                    load_run_id,
+                    started_at,
+                    completed_at,
+                    dataset_name,
+                    source_file,
+                    load_mode,
+                    status,
+                    rows_received,
+                    rows_inserted,
+                    rows_updated,
+                    duration_seconds,
+                    initiated_by,
+                    error_message
+                FROM metadata.load_run
+                WHERE dataset_name = :dataset_name
+                ORDER BY started_at DESC
+                LIMIT 25
+                """,
+                {
+                    "dataset_name": dataset_name,
+                },
+            )
+
+        else:
+            load_history = read_sql(
+                """
+                SELECT
+                    load_run_id,
+                    started_at,
+                    completed_at,
+                    dataset_name,
+                    source_file,
+                    load_mode,
+                    status,
+                    rows_received,
+                    rows_inserted,
+                    rows_updated,
+                    duration_seconds,
+                    initiated_by,
+                    error_message
+                FROM metadata.load_run
+                ORDER BY started_at DESC
+                LIMIT 25
+                """
+            )
+
+        if load_history.empty:
+            st.info(
+                "No load-history records are available yet."
+            )
+
+        else:
+            display_history = load_history.copy()
+
+            display_history["status"] = (
+                display_history["status"]
+                .map(
+                    {
+                        "completed": "✅ Completed",
+                        "failed": "❌ Failed",
+                        "running": "⏳ Running",
+                    }
+                )
+                .fillna(
+                    display_history["status"]
+                )
+            )
+
+            display_history["duration_seconds"] = (
+                pd.to_numeric(
+                    display_history["duration_seconds"],
+                    errors="coerce",
+                )
+                .round(2)
+            )
+
+            st.dataframe(
+                display_history[
+                    [
+                        "load_run_id",
+                        "started_at",
+                        "dataset_name",
+                        "source_file",
+                        "load_mode",
+                        "status",
+                        "rows_received",
+                        "rows_inserted",
+                        "rows_updated",
+                        "duration_seconds",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            failed_history = load_history[
+                load_history["status"] == "failed"
+            ]
+
+            if not failed_history.empty:
+                with st.expander(
+                    "Recent Load Errors"
+                ):
+                    selected_failed_run = st.selectbox(
+                        "Failed Load Run",
+                        failed_history[
+                            "load_run_id"
+                        ].tolist(),
+                        key="selected_failed_load_run",
+                    )
+
+                    failed_row = failed_history[
+                        failed_history["load_run_id"]
+                        == selected_failed_run
+                    ].iloc[0]
+
+                    st.error(
+                        failed_row["error_message"]
+                        or "No error message was recorded."
+                    )
+
+    except Exception as exc:
+        st.error(
+            f"Could not read load history: {exc}"
+        )
 
 elif page == "Steward Workbench":
     

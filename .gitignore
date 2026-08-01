@@ -41,3 +41,8 @@ downloads/
 
 # Local configuration
 config/local*
+
+data/uploads/
+*.upload
+
+data/staging/

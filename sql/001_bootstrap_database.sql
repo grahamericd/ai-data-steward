@@ -9,6 +9,7 @@ CREATE SCHEMA IF NOT EXISTS dq;
 CREATE SCHEMA IF NOT EXISTS raw;
 CREATE SCHEMA IF NOT EXISTS curated;
 CREATE SCHEMA IF NOT EXISTS reference;
+CREATE SCHEMA IF NOT EXISTS staging;
 
 -- =========================================================
 -- Metadata registry
@@ -92,6 +93,21 @@ CREATE TABLE IF NOT EXISTS metadata.dataset_run (
     error_message           TEXT
 );
 
+CREATE TABLE IF NOT EXISTS metadata.load_run (
+    id BIGSERIAL PRIMARY KEY,
+    dataset_name TEXT NOT NULL,
+    source_file_name TEXT,
+    source_file_path TEXT,
+    load_mode TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'started',
+    rows_received INTEGER DEFAULT 0,
+    rows_inserted INTEGER DEFAULT 0,
+    rows_updated INTEGER DEFAULT 0,
+    rows_rejected INTEGER DEFAULT 0,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    error_message TEXT
+);
 -- =========================================================
 -- Data-quality rule repository
 -- =========================================================
