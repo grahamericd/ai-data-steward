@@ -1,8 +1,8 @@
-import os
+#import os
 import json
-import subprocess
+#import subprocess
 from sqlalchemy import text
-from sqlalchemy.engine import URL
+#from sqlalchemy.engine import URL
 from pathlib import Path
 
 import sys
@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
     
 from config import RAW_DATA_DIR, engine
-
+from llm_client import LLMError, generate_json
 
 
 if len(sys.argv) != 2:
@@ -21,16 +21,16 @@ if len(sys.argv) != 2:
 DATASET_NAME = sys.argv[1]
 
 #DATASET_NAME = "corporate_data"
-MODEL = "llama3.2"
+#MODEL = "llama3.2"
 
-def call_ollama(prompt):
-    result = subprocess.run(
-        ["ollama", "run", MODEL],
-        input=prompt,
-        capture_output=True,
-        text=True
-    )
-    return result.stdout.strip()
+# def call_ollama(prompt):
+    # result = subprocess.run(
+        # ["ollama", "run", MODEL],
+        # input=prompt,
+        # capture_output=True,
+        # text=True
+    # )
+    # return result.stdout.strip()
 
 
 def build_prompt(profile):
@@ -229,15 +229,31 @@ def main():
 
         for profile in profiles:
             prompt = build_prompt(profile)
-            response = call_ollama(prompt)
 
             try:
-                rule_json = json.loads(response)
-                rule_json = apply_rule_guardrails(profile, rule_json)
-            except json.JSONDecodeError:
-                print(f"Skipped {profile['column_name']}: invalid JSON")
-                print(response)
+                rule_json = generate_json(prompt)
+
+                rule_json = apply_rule_guardrails(
+                    profile,
+                    rule_json
+                )
+
+            except LLMError as exc:
+                print(
+                    f"Skipped {profile['column_name']}: "
+                    f"{exc}"
+                )
                 continue
+            # prompt = build_prompt(profile)
+            # response = call_ollama(prompt)
+
+            # try:
+                # rule_json = json.loads(response)
+                # rule_json = apply_rule_guardrails(profile, rule_json)
+            # except json.JSONDecodeError:
+                # print(f"Skipped {profile['column_name']}: invalid JSON")
+                # print(response)
+                # continue
 
             conn.execute(
                 text("""

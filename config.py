@@ -14,9 +14,25 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_NAME = os.getenv("DB_NAME")
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+#OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+#OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+#############################################################
+LLM_PROVIDER = os.getenv(
+    "LLM_PROVIDER",
+    "ollama"
+).strip().lower()
 
+LLM_MODEL = os.getenv(
+    "LLM_MODEL"
+    #,OLLAMA_MODEL
+).strip()
+
+LLM_TIMEOUT_SECONDS = int(
+    os.getenv("LLM_TIMEOUT_SECONDS", "120")
+)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+##############################################################
 RAW_DATA_DIR = Path(
     os.getenv("RAW_DATA_DIR", str(PROJECT_ROOT / "raw_data"))
 ).expanduser()

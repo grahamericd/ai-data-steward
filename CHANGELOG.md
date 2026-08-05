@@ -44,3 +44,16 @@ Initial release
     - Incremental validation
     - Fixed-width parser improvements
     - Configuration management
+    
+### Configurable LLM Provider
+
+AI Data Steward uses a provider abstraction for LLM interactions.
+
+Currently validated:
+- Ollama local models
+
+Implemented but not yet validated:
+- OpenAI API provider
+- Anthropic API provider
+
+The active provider and model are selected through environment variables.
