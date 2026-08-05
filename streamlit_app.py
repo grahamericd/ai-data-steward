@@ -10,7 +10,8 @@ import tempfile
 import json
 from zoneinfo import ZoneInfo
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
+#PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
     
@@ -169,7 +170,8 @@ def get_datasets():
     return df["dataset_name"].tolist()
     
 def run_script(script_name, *args):
-    project_dir = os.path.expanduser("~/projects/data-lab")
+    #project_dir = os.path.expanduser("~/projects/data-lab")
+    project_dir = PROJECT_ROOT 
     python_path = os.path.join(project_dir, ".venv/bin/python")
     script_path = os.path.join(project_dir, "scripts", script_name)
 
