@@ -28,7 +28,7 @@ LLM_MODEL = os.getenv(
 ).strip()
 
 LLM_TIMEOUT_SECONDS = int(
-    os.getenv("LLM_TIMEOUT_SECONDS", "120")
+    os.getenv("LLM_TIMEOUT_SECONDS", "300")
 )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

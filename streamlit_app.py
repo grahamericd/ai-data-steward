@@ -1381,19 +1381,34 @@ elif page == "Dataset 360":
 
     with tab3:
         st.markdown("### Rule Catalog")
-
+        
         rules = read_sql("""
             SELECT
                 id,
+                dataset_name,
                 column_name,
                 rule_type,
+                rule_scope,
+                target_columns,
                 status,
                 created_at,
                 rule_definition
             FROM dq.rule
-            WHERE dataset_name = :dataset_name
             ORDER BY created_at DESC
         """, {"dataset_name": dataset_name})
+
+        # rules = read_sql("""
+            # SELECT
+                # id,
+                # column_name,
+                # rule_type,
+                # status,
+                # created_at,
+                # rule_definition
+            # FROM dq.rule
+            # WHERE dataset_name = :dataset_name
+            # ORDER BY created_at DESC
+        # """, {"dataset_name": dataset_name})
 
         st.dataframe(rules, use_container_width=True)
 
@@ -1859,79 +1874,354 @@ elif page == "Remediation Queue":
             # st.error(result.stderr)
             
 elif page == "Run Pipeline":
+
     st.header("Run Data Quality Pipeline")
+
     datasets = get_datasets()
+
     dataset_name = st.selectbox(
         "Select Dataset",
         datasets
     )
 
-    st.write(f"Selected dataset: `{dataset_name}`")
-    if st.button("Run Full Pipeline"):
+    st.write(
+        f"Selected dataset: `{dataset_name}`"
+    )
+
+    # =========================================================
+    # BUSINESS RULE ANALYSIS
+    # =========================================================
+
+    st.markdown("### Business Rule Analysis")
+
+    st.write(
+        "Generate quality rules at the column, "
+        "multi-column, or dataset level."
+    )
+
+    rule_col1, rule_col2, rule_col3 = st.columns(3)
+
+    # ---------------------------------------------------------
+    # Column Rules
+    # ---------------------------------------------------------
+
+    with rule_col1:
+
+        if st.button(
+            "Generate Column Rules",
+            use_container_width=True,
+            key="generate_column_rules"
+        ):
+
+            with st.spinner(
+                "Generating column-level rules..."
+            ):
+
+                result = run_script(
+                    "generate_rules.py",
+                    dataset_name
+                )
+
+            st.subheader(
+                "Column Rule Generation Output"
+            )
+
+            st.code(
+                result.stdout
+            )
+
+            if result.stderr:
+                st.subheader(
+                    "Errors / Warnings"
+                )
+
+                st.error(
+                    result.stderr
+                )
+
+            if result.returncode == 0:
+                st.success(
+                    "Column rule generation completed successfully."
+                )
+            else:
+                st.error(
+                    "Column rule generation failed."
+                )
+
+    # ---------------------------------------------------------
+    # Multi-Column / Row Rules
+    # ---------------------------------------------------------
+
+    with rule_col2:
+
+        if st.button(
+            "Generate Multi-Column Rules",
+            use_container_width=True,
+            key="generate_multicolumn_rules"
+        ):
+
+            with st.spinner(
+                "Analyzing relationships between columns. "
+                "This may take several minutes..."
+            ):
+
+                result = run_script(
+                    "generate_multicolumn_rules.py",
+                    dataset_name
+                )
+
+            st.subheader(
+                "Multi-Column Rule Output"
+            )
+
+            st.code(
+                result.stdout
+            )
+
+            if result.stderr:
+                st.subheader(
+                    "Errors / Warnings"
+                )
+
+                st.error(
+                    result.stderr
+                )
+
+            if result.returncode == 0:
+                st.success(
+                    "Multi-column analysis completed successfully."
+                )
+            else:
+                st.error(
+                    "Multi-column analysis failed."
+                )
+
+    # ---------------------------------------------------------
+    # Dataset Rules
+    # ---------------------------------------------------------
+
+    with rule_col3:
+
+        if st.button(
+            "Generate Dataset Rules",
+            use_container_width=True,
+            key="generate_dataset_rules"
+        ):
+
+            with st.spinner(
+                "Generating dataset-level rules..."
+            ):
+
+                result = run_script(
+                    "generate_dataset_rules.py",
+                    dataset_name
+                )
+
+            st.subheader(
+                "Dataset Rule Output"
+            )
+
+            st.code(
+                result.stdout
+            )
+
+            if result.stderr:
+                st.subheader(
+                    "Errors / Warnings"
+                )
+
+                st.error(
+                    result.stderr
+                )
+
+            if result.returncode == 0:
+                st.success(
+                    "Dataset rule generation completed successfully."
+                )
+            else:
+                st.error(
+                    "Dataset rule generation failed."
+                )
+
+    st.divider()
+
+    # =========================================================
+    # FULL PIPELINE
+    # =========================================================
+
+    st.subheader("Run Full Pipeline")
+
+    if st.button(
+        "Run Full Pipeline",
+        key="run_full_pipeline"
+    ):
+
         result = run_script(
             "run_pipeline.py",
             dataset_name
         )
 
-        st.subheader("Pipeline Output")
-        st.code(result.stdout)
+        st.subheader(
+            "Pipeline Output"
+        )
+
+        st.code(
+            result.stdout
+        )
 
         if result.stderr:
-            st.subheader("Errors / Warnings")
-            st.error(result.stderr)
+
+            st.subheader(
+                "Errors / Warnings"
+            )
+
+            st.error(
+                result.stderr
+            )
 
         if result.returncode == 0:
-            st.success("Pipeline completed successfully.")
+
+            st.success(
+                "Pipeline completed successfully."
+            )
+
         else:
-            st.error("Pipeline failed.")
-            
-    st.subheader("Evaluate Rules Only")
-    if st.button("Evaluate Approved Rules"):
+
+            st.error(
+                "Pipeline failed."
+            )
+
+    # =========================================================
+    # EVALUATE APPROVED RULES
+    # =========================================================
+
+    st.subheader(
+        "Evaluate Rules Only"
+    )
+
+    if st.button(
+        "Evaluate Approved Rules",
+        key="evaluate_approved_rules"
+    ):
+
         result = run_script(
             "evaluate_rules.py",
             dataset_name
         )
 
-        st.subheader("Rule Evaluation Output")
-        st.code(result.stdout)
+        st.subheader(
+            "Rule Evaluation Output"
+        )
+
+        st.code(
+            result.stdout
+        )
+
         if result.stderr:
-            st.error(result.stderr)
+
+            st.error(
+                result.stderr
+            )
+
         if result.returncode == 0:
-            st.success("Approved rules evaluated successfully.")
+
+            st.success(
+                "Approved rules evaluated successfully."
+            )
+
         else:
-            st.error("Rule evaluation failed.")
-    
-    
-    st.subheader("Generate Remediation Suggestions")
-    if st.button("Generate Remediation Suggestions"):
+
+            st.error(
+                "Rule evaluation failed."
+            )
+
+    # =========================================================
+    # REMEDIATION SUGGESTIONS
+    # =========================================================
+
+    st.subheader(
+        "Generate Remediation Suggestions"
+    )
+
+    if st.button(
+        "Generate Remediation Suggestions",
+        key="generate_remediation_suggestions"
+    ):
 
         result = run_script(
             "generate_remediation_suggestions.py",
             dataset_name
         )
-        st.subheader("Remediation Suggestion Output")
-        st.code(result.stdout)
+
+        st.subheader(
+            "Remediation Suggestion Output"
+        )
+
+        st.code(
+            result.stdout
+        )
+
         if result.stderr:
-            st.error(result.stderr)
+
+            st.error(
+                result.stderr
+            )
+
         if result.returncode == 0:
-            st.success("Remediation suggestions generated successfully.")
+
+            st.success(
+                "Remediation suggestions generated successfully."
+            )
+
         else:
-            st.error("Generate remediation suggestions failed.")
-                
-    st.subheader("Apply Approved Remediations")
-    if st.button("Apply Approved Remediations"):
+
+            st.error(
+                "Generate remediation suggestions failed."
+            )
+
+    # =========================================================
+    # APPLY APPROVED REMEDIATIONS
+    # =========================================================
+
+    st.subheader(
+        "Apply Approved Remediations"
+    )
+
+    if st.button(
+        "Apply Approved Remediations",
+        key="apply_approved_remediations"
+    ):
+
         result = run_script(
             "apply_remediations.py",
             dataset_name
-        ) 
-        st.subheader("Remediation Output")
-        st.code(result.stdout)
+        )
+
+        st.subheader(
+            "Remediation Output"
+        )
+
+        st.code(
+            result.stdout
+        )
+
         if result.stderr:
-            st.error(result.stderr)
+
+            st.error(
+                result.stderr
+            )
+
         if result.returncode == 0:
-            st.success("Approved remediations applied successfully.")
+
+            st.success(
+                "Approved remediations applied successfully."
+            )
+
         else:
-            st.error("Apply remediations failed.")        
+
+            st.error(
+                "Apply remediations failed."
+            )
             
 elif page == "Raw Data Preview":
     st.header("Raw Data Preview")
