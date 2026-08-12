@@ -15,16 +15,24 @@ class LLMError(RuntimeError):
     """Raised when an LLM provider cannot return a usable response."""
 
 
-def _extract_json_object(response_text: str) -> dict[str, Any]:
+def _extract_json_object(response_text: str) -> dict:
     """
-    Parse an LLM response as JSON.
+    Extract and parse a JSON object from an LLM response.
 
-    Also handles a model wrapping JSON in a Markdown code fence.
+    Handles:
+    - pure JSON responses
+    - Markdown code fences
+    - explanatory text before or after the JSON
     """
 
     cleaned = response_text.strip()
 
+    # ---------------------------------------------------------
+    # Remove Markdown code fences when present
+    # ---------------------------------------------------------
+
     if cleaned.startswith("```"):
+
         lines = cleaned.splitlines()
 
         if lines and lines[0].startswith("```"):
@@ -33,23 +41,79 @@ def _extract_json_object(response_text: str) -> dict[str, Any]:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
 
-        cleaned = "\n".join(lines).strip()
+        cleaned = "\n".join(
+            lines
+        ).strip()
 
         if cleaned.lower().startswith("json"):
             cleaned = cleaned[4:].strip()
 
+    # ---------------------------------------------------------
+    # First try normal JSON parsing
+    # ---------------------------------------------------------
+
     try:
-        parsed = json.loads(cleaned)
+
+        parsed = json.loads(
+            cleaned
+        )
+
+        if not isinstance(
+            parsed,
+            dict
+        ):
+            raise LLMError(
+                "The LLM response must be a JSON object."
+            )
+
+        return parsed
+
+    except json.JSONDecodeError:
+        pass
+
+    # ---------------------------------------------------------
+    # Model may have included prose before/after JSON.
+    # Find the first complete JSON object.
+    # ---------------------------------------------------------
+
+    start = cleaned.find("{")
+
+    if start == -1:
+
+        raise LLMError(
+            "The LLM response did not contain a JSON object. "
+            f"Response begins with: {cleaned[:500]}"
+        )
+
+    decoder = json.JSONDecoder()
+
+    try:
+
+        parsed, end_position = decoder.raw_decode(
+            cleaned[start:]
+        )
 
     except json.JSONDecodeError as exc:
+        
         raise LLMError(
-            "The LLM returned invalid JSON. "
-            f"Response begins with: {cleaned[:500]}"
+            "The LLM returned invalid JSON.\n\n"
+            f"JSON ERROR: {exc}\n\n"
+            "FULL RESPONSE:\n"
+            f"{cleaned}"
         ) from exc
 
-    if not isinstance(parsed, dict):
+        # raise LLMError(
+            # "The LLM returned invalid JSON. "
+            # f"Response begins with: {cleaned[:500]}"
+        # ) from exc
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+
         raise LLMError(
-            "The LLM response must be a JSON object."
+            "The extracted LLM response must be a JSON object."
         )
 
     return parsed

@@ -1,15 +1,15 @@
 import json
 import re
 import sys
-from collections import defaultdict
+import pandas as pd
 from pathlib import Path
 
 from sqlalchemy import text
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # Project imports
-# ---------------------------------------------------------------------
+# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -28,13 +28,14 @@ from llm_client import (
 )
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # Configuration
-# ---------------------------------------------------------------------
+# ============================================================
 
-MAX_GROUP_SIZE = 10
-MAX_RULES_PER_GROUP = 3
-MIN_CONFIDENCE = 0.70
+MAX_CANDIDATES = 3
+MIN_CONFIDENCE = 0.75
+MIN_OBSERVED_SUPPORT = 0.95
+MIN_COMPARABLE_ROWS = 25
 
 SUPPORTED_RULE_TYPES = {
     "column_comparison",
@@ -43,7 +44,7 @@ SUPPORTED_RULE_TYPES = {
     "columns_equal",
 }
 
-SUPPORTED_COMPARISON_OPERATORS = {
+SUPPORTED_OPERATORS = {
     "==",
     "!=",
     "<",
@@ -53,9 +54,9 @@ SUPPORTED_COMPARISON_OPERATORS = {
 }
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # Command-line argument
-# ---------------------------------------------------------------------
+# ============================================================
 
 if len(sys.argv) != 2:
     print(
@@ -66,11 +67,12 @@ if len(sys.argv) != 2:
 DATASET_NAME = sys.argv[1]
 
 
-# ---------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------
+# ============================================================
+# Metadata retrieval
+# ============================================================
 
 def get_dataset(conn, dataset_name):
+
     return conn.execute(
         text("""
             SELECT *
@@ -78,11 +80,14 @@ def get_dataset(conn, dataset_name):
             WHERE dataset_name = :dataset_name
               AND active = TRUE
         """),
-        {"dataset_name": dataset_name},
+        {
+            "dataset_name": dataset_name,
+        },
     ).mappings().first()
 
 
 def get_column_profiles(conn, dataset_name):
+
     return conn.execute(
         text("""
             SELECT
@@ -99,11 +104,14 @@ def get_column_profiles(conn, dataset_name):
             WHERE dataset_name = :dataset_name
             ORDER BY column_name
         """),
-        {"dataset_name": dataset_name},
+        {
+            "dataset_name": dataset_name,
+        },
     ).mappings().all()
 
 
 def get_existing_rules(conn, dataset_name):
+
     return conn.execute(
         text("""
             SELECT
@@ -115,850 +123,815 @@ def get_existing_rules(conn, dataset_name):
                 status
             FROM dq.rule
             WHERE dataset_name = :dataset_name
-              AND status NOT IN ('rejected', 'retired')
+              AND status NOT IN (
+                  'rejected',
+                  'retired'
+              )
             ORDER BY id
         """),
-        {"dataset_name": dataset_name},
+        {
+            "dataset_name": dataset_name,
+        },
     ).mappings().all()
 
 
-# ---------------------------------------------------------------------
-# Profile helpers
-# ---------------------------------------------------------------------
-
-def profile_to_dict(profile):
-    return {
-        "column_name": profile["column_name"],
-        "inferred_type": profile["inferred_type"],
-        "null_percent": profile["null_percent"],
-        "distinct_count": profile["distinct_count"],
-        "sample_values": profile["sample_values"],
-    }
-
+# ============================================================
+# General helpers
+# ============================================================
 
 def normalize_name(name):
+
     return re.sub(
         r"[^a-z0-9]+",
         "_",
-        name.lower(),
+        str(name).lower(),
     ).strip("_")
 
 
-def tokens_for_column(name):
-    tokens = [
-        token
-        for token in normalize_name(name).split("_")
-        if token
-    ]
+def tokenize(name):
 
-    stop_words = {
-        "the",
-        "of",
-        "a",
-        "an",
+    ignored = {
         "field",
         "value",
-        "code",
-        "number",
-        "num",
-        "seq",
-        "sequence",
-        "id",
+        "record",
+        "data",
+        "the",
+        "of",
     }
 
     return [
         token
-        for token in tokens
-        if token not in stop_words
+        for token in normalize_name(name).split("_")
+        if token
+        and token not in ignored
     ]
 
 
-# ---------------------------------------------------------------------
-# Candidate discovery
-# ---------------------------------------------------------------------
+def normalize_type(inferred_type):
 
-def discover_candidate_groups(profiles):
-    """
-    Identify likely multi-column relationships before asking the LLM.
+    value = str(
+        inferred_type or ""
+    ).lower()
 
-    Returns a list of dictionaries:
-    {
-        "reason": "...",
-        "columns": [...]
+    if any(
+        item in value
+        for item in [
+            "int",
+            "float",
+            "decimal",
+            "numeric",
+            "number",
+        ]
+    ):
+        return "numeric"
+
+    if any(
+        item in value
+        for item in [
+            "date",
+            "datetime",
+            "timestamp",
+        ]
+    ):
+        return "date"
+
+    if any(
+        item in value
+        for item in [
+            "bool",
+            "boolean",
+        ]
+    ):
+        return "boolean"
+
+    return "text"
+
+
+def trim_sample_values(
+    value,
+    max_values=4,
+):
+
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return value[:max_values]
+
+    if isinstance(value, tuple):
+        return list(
+            value[:max_values]
+        )
+
+    if isinstance(value, str):
+
+        try:
+            parsed = json.loads(
+                value
+            )
+
+            if isinstance(
+                parsed,
+                list,
+            ):
+                return parsed[
+                    :max_values
+                ]
+
+        except json.JSONDecodeError:
+            pass
+
+        return [
+            value[:200]
+        ]
+
+    return [
+        str(value)[:200]
+    ]
+
+
+def compact_profile(profile):
+
+    return {
+        "column_name":
+            profile["column_name"],
+
+        "inferred_type":
+            profile["inferred_type"],
+
+        "null_percent":
+            profile["null_percent"],
+
+        "distinct_count":
+            profile["distinct_count"],
+
+        "sample_values":
+            trim_sample_values(
+                profile["sample_values"]
+            ),
     }
+
+
+# ============================================================
+# Structural helpers
+# ============================================================
+
+def structural_name(column_name):
+    """
+    Generalize repeating numbered columns.
+
+    owner_1_city -> owner_{n}_city
+    owner_6_city -> owner_{n}_city
+    """
+
+    return re.sub(
+        r"(^|_)\d+(_|$)",
+        r"\1{n}\2",
+        normalize_name(column_name),
+    )
+
+
+def structural_pair_signature(
+    left_column,
+    right_column,
+    candidate_type,
+):
+    """
+    Prevent owner_1 / owner_2 / owner_3 versions of the same
+    relationship from all being sent to the LLM.
+    """
+
+    names = sorted(
+        [
+            structural_name(
+                left_column
+            ),
+            structural_name(
+                right_column
+            ),
+        ]
+    )
+
+    return (
+        candidate_type,
+        names[0],
+        names[1],
+    )
+
+
+# ============================================================
+# Candidate scoring
+# ============================================================
+
+def add_candidate(
+    candidates,
+    seen_signatures,
+    *,
+    candidate_type,
+    left_column,
+    right_column,
+    score,
+    reason,
+    allowed_rule_types,
+):
+
+    if left_column == right_column:
+        return
+
+    signature = structural_pair_signature(
+        left_column,
+        right_column,
+        candidate_type,
+    )
+
+    if signature in seen_signatures:
+        return
+
+    seen_signatures.add(
+        signature
+    )
+
+    candidates.append(
+        {
+            "candidate_type":
+                candidate_type,
+
+            "left_column":
+                left_column,
+
+            "right_column":
+                right_column,
+
+            "score":
+                score,
+
+            "reason":
+                reason,
+
+            "allowed_rule_types":
+                allowed_rule_types,
+        }
+    )
+
+
+# ============================================================
+# Candidate discovery
+# ============================================================
+def parse_date_series(series):
+    """
+    Parse common source-system date formats deterministically.
+
+    Tries known formats before falling back to general parsing.
+    """
+
+    cleaned = (
+        series
+        .astype("string")
+        .str.strip()
+        .replace(
+            {
+                "": pd.NA,
+                "None": pd.NA,
+                "nan": pd.NA,
+                "NaN": pd.NA,
+            }
+        )
+    )
+
+    result = pd.Series(
+        pd.NaT,
+        index=cleaned.index,
+        dtype="datetime64[ns]",
+    )
+
+    formats = [
+        "%m%d%Y",    # 06122026
+        "%Y%m%d",    # 20260612
+        "%m/%d/%Y",  # 06/12/2026
+        "%Y-%m-%d",  # 2026-06-12
+    ]
+
+    for date_format in formats:
+
+        remaining = (
+            result.isna()
+            & cleaned.notna()
+        )
+
+        if not remaining.any():
+            break
+
+        parsed = pd.to_datetime(
+            cleaned.loc[remaining],
+            format=date_format,
+            errors="coerce",
+        )
+
+        result.loc[remaining] = parsed
+
+    return result
+
+
+
+def analyze_date_relationship(
+    df,
+    left_column,
+    right_column,
+):
+    """
+    Empirically test both possible ordering relationships
+    between two date-like columns.
+
+    Returns the strongest observed relationship, or None if
+    there is not enough evidence.
+    """
+
+    working = df[
+        [
+            left_column,
+            right_column,
+        ]
+    ].copy()
+    
+    working[left_column] = parse_date_series(
+        working[left_column]
+    )
+
+    working[right_column] = parse_date_series(
+        working[right_column]
+)
+
+    # working[left_column] = pd.to_datetime(
+        # working[left_column],
+        # errors="coerce",
+    # )
+
+    # working[right_column] = pd.to_datetime(
+        # working[right_column],
+        # errors="coerce",
+    # )
+
+    comparable = working[
+        working[left_column].notna()
+        & working[right_column].notna()
+    ]
+
+    comparable_rows = len(
+        comparable
+    )
+
+    if comparable_rows < MIN_COMPARABLE_ROWS:
+        return None
+
+    left_before_right = (
+        comparable[left_column]
+        <= comparable[right_column]
+    )
+
+    right_before_left = (
+        comparable[right_column]
+        <= comparable[left_column]
+    )
+
+    left_support = (
+        left_before_right.sum()
+        / comparable_rows
+    )
+
+    right_support = (
+        right_before_left.sum()
+        / comparable_rows
+    )
+
+    if left_support >= right_support:
+
+        operator = "<="
+        stronger_left = left_column
+        stronger_right = right_column
+        support = left_support
+        failed_count = int(
+            (~left_before_right).sum()
+        )
+
+    else:
+
+        operator = "<="
+        stronger_left = right_column
+        stronger_right = left_column
+        support = right_support
+        failed_count = int(
+            (~right_before_left).sum()
+        )
+
+    return {
+        "left_column": stronger_left,
+        "operator": operator,
+        "right_column": stronger_right,
+        "comparable_rows": comparable_rows,
+        "passed_rows": (
+            comparable_rows
+            - failed_count
+        ),
+        "failed_rows": failed_count,
+        "support": round(
+            support,
+            4,
+        ),
+    }
+
+
+
+def discover_candidates(profiles):
+    """
+    Discover SPECIFIC pair relationships.
+
+    Python narrows the search space before the LLM is called.
     """
 
     profile_map = {
-        profile["column_name"]: profile
+        profile["column_name"]:
+            profile
         for profile in profiles
     }
 
-    column_names = list(profile_map.keys())
+    columns = list(
+        profile_map.keys()
+    )
 
-    groups = []
-    seen = set()
+    candidates = []
+    seen_signatures = set()
 
-    def add_group(reason, columns):
-        cleaned = []
+    # --------------------------------------------------------
+    # DATE / DATE relationships
+    # --------------------------------------------------------
 
-        for column in columns:
-            if (
-                column in profile_map
-                and column not in cleaned
-            ):
-                cleaned.append(column)
-
-        if len(cleaned) < 2:
-            return
-
-        if len(cleaned) > MAX_GROUP_SIZE:
-            cleaned = cleaned[:MAX_GROUP_SIZE]
-
-        key = tuple(sorted(cleaned))
-
-        if key in seen:
-            return
-
-        seen.add(key)
-
-        groups.append(
-            {
-                "reason": reason,
-                "columns": cleaned,
-            }
-        )
-
-    # -------------------------------------------------------------
-    # 1. Date groups
-    # -------------------------------------------------------------
-
-    date_columns = []
-
-    for profile in profiles:
-        name = profile["column_name"].lower()
-        inferred = str(
-            profile["inferred_type"] or ""
-        ).lower()
-
+    date_columns = [
+        column
+        for column in columns
         if (
-            "date" in name
-            or "time" in name
-            or inferred in {
-                "date",
-                "datetime",
-                "timestamp",
-            }
-        ):
-            date_columns.append(
-                profile["column_name"]
+            normalize_type(
+                profile_map[
+                    column
+                ]["inferred_type"]
             )
-
-    # Avoid throwing every date field into one giant prompt.
-    for i in range(0, len(date_columns), MAX_GROUP_SIZE):
-        chunk = date_columns[
-            i:i + MAX_GROUP_SIZE
-        ]
-
-        add_group(
-            "Columns appear to represent dates or timestamps.",
-            chunk,
-        )
-
-    # -------------------------------------------------------------
-    # 2. Status + date groups
-    # -------------------------------------------------------------
-
-    status_columns = [
-        profile["column_name"]
-        for profile in profiles
-        if any(
-            token in profile["column_name"].lower()
-            for token in [
-                "status",
-                "state",
-                "active",
-                "inactive",
-                "cancel",
-                "expire",
-                "dissol",
-                "event",
-            ]
+            == "date"
+            or "date"
+            in normalize_name(
+                column
+            )
         )
     ]
 
+    start_words = {
+        "start",
+        "begin",
+        "file",
+        "filing",
+        "filed",
+        "effective",
+        "created",
+        "creation",
+        "registration",
+    }
+
+    end_words = {
+        "end",
+        "expire",
+        "expiration",
+        "cancel",
+        "cancellation",
+        "termination",
+        "dissolution",
+        "closed",
+    }
+
+    for left in date_columns:
+
+        left_tokens = set(
+            tokenize(left)
+        )
+
+        for right in date_columns:
+
+            if left >= right:
+                continue
+
+            right_tokens = set(
+                tokenize(right)
+            )
+
+            score = 0
+
+            if (
+                left_tokens
+                & start_words
+                and right_tokens
+                & end_words
+            ):
+                score = 100
+
+            elif (
+                right_tokens
+                & start_words
+                and left_tokens
+                & end_words
+            ):
+                score = 100
+
+            elif (
+                left_tokens
+                & right_tokens
+            ):
+                score = 85
+
+            if score:
+
+                add_candidate(
+                    candidates,
+                    seen_signatures,
+                    candidate_type=
+                        "date_relationship",
+
+                    left_column=left,
+                    right_column=right,
+
+                    score=score,
+
+                    reason=(
+                        "These columns appear to represent "
+                        "related lifecycle dates."
+                    ),
+
+                    allowed_rule_types={
+                        "column_comparison"
+                    },
+                )
+
+    # --------------------------------------------------------
+    # STATUS / DATE relationships
+    # --------------------------------------------------------
+
+    status_words = {
+        "status",
+        "active",
+        "inactive",
+        "cancel",
+        "cancellation",
+        "expire",
+        "expiration",
+        "dissolution",
+        "termination",
+    }
+
+    status_columns = [
+    column
+    for column in columns
+    if (
+        set(tokenize(column))
+        & status_words
+    )
+    and normalize_type(
+        profile_map[
+            column
+        ]["inferred_type"]
+    ) != "date"
+    and "date" not in normalize_name(
+        column
+    )
+]
     for status_column in status_columns:
-        related = [
-            status_column
-        ]
 
         status_tokens = set(
-            tokens_for_column(
+            tokenize(
                 status_column
             )
         )
 
         for date_column in date_columns:
+
             date_tokens = set(
-                tokens_for_column(
+                tokenize(
                     date_column
                 )
             )
 
-            if (
+            shared = (
                 status_tokens
                 & date_tokens
-            ):
-                related.append(
-                    date_column
-                )
-
-        # Even without shared tokens, a status field plus a few date
-        # fields can be a useful candidate group.
-        if len(related) == 1:
-            related.extend(
-                date_columns[:4]
             )
 
-        add_group(
-            "Status or lifecycle fields may have conditional relationships "
-            "with date fields.",
-            related,
-        )
+            if not shared:
+                continue
 
-    # -------------------------------------------------------------
-    # 3. Address/location groups
-    # -------------------------------------------------------------
+            add_candidate(
+                candidates,
+                seen_signatures,
+                candidate_type=
+                    "status_date_relationship",
 
-    location_keywords = {
-        "address",
-        "addr",
-        "city",
-        "state",
-        "zip",
-        "postal",
-        "county",
-        "country",
-    }
+                left_column=
+                    status_column,
 
-    location_columns = [
-        profile["column_name"]
-        for profile in profiles
-        if any(
-            keyword in profile["column_name"].lower()
-            for keyword in location_keywords
-        )
-    ]
+                right_column=
+                    date_column,
 
-    # Group location fields by shared prefix.
-    prefix_groups = defaultdict(list)
+                score=95,
 
-    for column in location_columns:
-        normalized = normalize_name(
-            column
-        )
+                reason=(
+                    "A lifecycle status may determine "
+                    "whether its related date is required."
+                ),
 
-        parts = normalized.split("_")
-
-        if len(parts) > 1:
-            prefix = "_".join(
-                parts[:-1]
-            )
-        else:
-            prefix = normalized
-
-        prefix_groups[
-            prefix
-        ].append(column)
-
-    for prefix, columns in prefix_groups.items():
-        if len(columns) >= 2:
-            add_group(
-                f"Location fields share a common prefix: {prefix}",
-                columns,
+                allowed_rule_types={
+                    "conditional_required"
+                },
             )
 
-    # -------------------------------------------------------------
-    # 4. Shared semantic tokens
-    # -------------------------------------------------------------
+    # --------------------------------------------------------
+    # IDENTIFIER alternatives
+    # --------------------------------------------------------
 
-    token_groups = defaultdict(list)
-
-    for column in column_names:
-        for token in tokens_for_column(
-            column
-        ):
-            if len(token) >= 4:
-                token_groups[
-                    token
-                ].append(column)
-
-    for token, columns in token_groups.items():
-        if 2 <= len(columns) <= MAX_GROUP_SIZE:
-            add_group(
-                f"Columns share semantic token '{token}'.",
-                columns,
-            )
-
-    # -------------------------------------------------------------
-    # 5. Principal / repeating entity groups
-    # -------------------------------------------------------------
-
-    repeating_patterns = defaultdict(list)
-
-    for column in column_names:
-        normalized = normalize_name(
-            column
-        )
-
-        # Convert:
-        # principal_1_name
-        # principal_2_name
-        # into:
-        # principal_{n}_name
-
-        generalized = re.sub(
-            r"(^|_)\d+(_|$)",
-            r"\1{n}\2",
-            normalized,
-        )
-
-        repeating_patterns[
-            generalized
-        ].append(column)
-
-    for pattern, columns in repeating_patterns.items():
-        if len(columns) >= 2:
-            add_group(
-                f"Columns appear to be repeated instances of '{pattern}'.",
-                columns,
-            )
-
-    # -------------------------------------------------------------
-    # 6. Identifier groups
-    # -------------------------------------------------------------
-
-    id_keywords = {
+    identifier_words = {
         "id",
+        "identifier",
         "number",
-        "doc",
         "document",
-        "seq",
-        "sequence",
-        "key",
-        "code",
+        "license",
+        "registration",
+        "fei",
+        "ein",
+        "ssn",
     }
 
     identifier_columns = [
         column
-        for column in column_names
-        if any(
-            keyword in column.lower()
-            for keyword in id_keywords
+        for column in columns
+        if set(
+            tokenize(column)
         )
+        & identifier_words
     ]
 
-    # Break identifiers into reasonable chunks.
-    for i in range(
-        0,
-        len(identifier_columns),
-        MAX_GROUP_SIZE,
+    for i, left in enumerate(
+        identifier_columns
     ):
-        chunk = identifier_columns[
-            i:i + MAX_GROUP_SIZE
-        ]
 
-        add_group(
-            "Columns appear to contain related identifiers or sequence values.",
-            chunk,
+        left_tokens = set(
+            tokenize(left)
         )
 
-    return groups
+        for right in identifier_columns[
+            i + 1:
+        ]:
 
+            right_tokens = set(
+                tokenize(right)
+            )
 
-# ---------------------------------------------------------------------
-# Prompt
-# ---------------------------------------------------------------------
+            # Require some semantic overlap.
+            if not (
+                left_tokens
+                & right_tokens
+            ):
+                continue
 
-def build_group_prompt(
-    dataset,
-    group,
-    profiles,
-    existing_rules,
-):
-    profile_map = {
-        profile["column_name"]: profile
-        for profile in profiles
-    }
+            add_candidate(
+                candidates,
+                seen_signatures,
+                candidate_type=
+                    "identifier_relationship",
 
-    selected_profiles = [
-        profile_to_dict(
-            profile_map[column]
+                left_column=left,
+                right_column=right,
+
+                score=75,
+
+                reason=(
+                    "These columns appear to represent "
+                    "related identifiers."
+                ),
+
+                allowed_rule_types={
+                    "at_least_one_present"
+                },
+            )
+
+    # --------------------------------------------------------
+    # True duplicate-semantic fields
+    #
+    # This is the ONLY candidate family allowed to propose
+    # columns_equal.
+    # --------------------------------------------------------
+
+    for i, left in enumerate(
+        columns
+    ):
+
+        left_structural = (
+            structural_name(
+                left
+            )
         )
-        for column in group["columns"]
-    ]
 
-    relevant_existing_rules = []
+        left_type = normalize_type(
+            profile_map[
+                left
+            ]["inferred_type"]
+        )
 
-    group_columns = set(
-        group["columns"]
-    )
+        for right in columns[
+            i + 1:
+        ]:
 
-    for rule in existing_rules:
-        targets = rule[
-            "target_columns"
-        ]
-
-        if isinstance(
-            targets,
-            str,
-        ):
-            try:
-                targets = json.loads(
-                    targets
+            right_structural = (
+                structural_name(
+                    right
                 )
-            except json.JSONDecodeError:
-                targets = []
-
-        targets = set(
-            targets or []
-        )
-
-        if targets & group_columns:
-            relevant_existing_rules.append(
-                {
-                    "id": rule["id"],
-                    "scope": rule["rule_scope"],
-                    "target_columns": list(
-                        targets
-                    ),
-                    "status": rule["status"],
-                    "rule_definition": rule[
-                        "rule_definition"
-                    ],
-                }
             )
 
-    return f"""
-You are a senior enterprise data steward.
+            right_type = normalize_type(
+                profile_map[
+                    right
+                ]["inferred_type"]
+            )
 
-Analyze ONLY the following small group of related columns and determine
-whether there are meaningful deterministic relationships between them.
+            if left_type != right_type:
+                continue
 
-Dataset:
-{dataset['dataset_name']}
+            # Only treat fields as equality candidates when their
+            # generalized semantic names are actually identical.
+            #
+            # Example:
+            # owner_1_state vs owner_2_state
+            #
+            # NOT:
+            # owner_1_city vs owner_1_address
 
-Dataset description:
-{dataset.get('description')}
+            if (
+                left_structural
+                != right_structural
+            ):
+                continue
 
-Candidate-group reason:
-{group['reason']}
+            add_candidate(
+                candidates,
+                seen_signatures,
+                candidate_type=
+                    "duplicate_semantic_field",
 
-Column profiles:
-{json.dumps(selected_profiles, indent=2, default=str)}
+                left_column=left,
+                right_column=right,
 
-Relevant existing rules:
-{json.dumps(relevant_existing_rules, indent=2, default=str)}
+                score=70,
 
-Your job is to propose up to {MAX_RULES_PER_GROUP} high-confidence
-ROW-level data quality rules.
+                reason=(
+                    "The columns have the same generalized "
+                    "semantic field name."
+                ),
 
-Do NOT propose single-column rules.
+                allowed_rule_types={
+                    "columns_equal"
+                },
+            )
 
-Do NOT invent business requirements merely because columns appear related.
+    # --------------------------------------------------------
+    # Rank candidates
+    # --------------------------------------------------------
 
-If evidence is insufficient, return an empty rules array.
+    candidates.sort(
+        key=lambda item:
+            item["score"],
+        reverse=True,
+    )
 
-SUPPORTED RULE TYPES:
-
-1. column_comparison
-
-{{
-  "type": "column_comparison",
-  "parameters": {{
-    "left_column": "column_a",
-    "operator": "<=",
-    "right_column": "column_b",
-    "null_behavior": "ignore"
-  }}
-}}
-
-Allowed operators:
-==
-!=
-<
-<=
->
->=
-
-2. conditional_required
-
-{{
-  "type": "conditional_required",
-  "parameters": {{
-    "condition_column": "status",
-    "condition_operator": "==",
-    "condition_value": "C",
-    "required_column": "cancel_date"
-  }}
-}}
-
-condition_operator must be ==
-
-3. at_least_one_present
-
-{{
-  "type": "at_least_one_present",
-  "parameters": {{
-    "columns": [
-      "field_a",
-      "field_b"
+    return candidates[
+        :MAX_CANDIDATES
     ]
-  }}
-}}
-
-4. columns_equal
-
-{{
-  "type": "columns_equal",
-  "parameters": {{
-    "columns": [
-      "field_a",
-      "field_b"
-    ],
-    "ignore_nulls": true
-  }}
-}}
-
-Return ONLY:
-
-{{
-  "rules": [
-    {{
-      "business_definition": "",
-      "confidence_score": 0.0,
-      "evidence": "",
-      "target_columns": [],
-      "executable_rule": {{
-        "type": "",
-        "parameters": {{}}
-      }}
-    }}
-  ]
-}}
-
-Requirements:
-
-- Return only valid JSON.
-- No Markdown.
-- No SQL.
-- Maximum {MAX_RULES_PER_GROUP} rules.
-- Every rule must involve at least two distinct supplied columns.
-- Never reference a column outside this group.
-- confidence_score must be between 0 and 1.
-"""
 
 
-# ---------------------------------------------------------------------
-# Rule interpretation
-# ---------------------------------------------------------------------
+# ============================================================
+# Existing rule signatures
+# ============================================================
 
-def get_referenced_columns(rule):
-    executable_rule = rule.get(
-        "executable_rule",
-        {},
-    )
-
-    rule_type = executable_rule.get(
-        "type",
-        "",
-    )
-
-    parameters = executable_rule.get(
-        "parameters",
-        {},
-    )
-
-    columns = []
-
-    if rule_type == "column_comparison":
-        columns.extend(
-            [
-                parameters.get(
-                    "left_column"
-                ),
-                parameters.get(
-                    "right_column"
-                ),
-            ]
-        )
-
-    elif rule_type == "conditional_required":
-        columns.extend(
-            [
-                parameters.get(
-                    "condition_column"
-                ),
-                parameters.get(
-                    "required_column"
-                ),
-            ]
-        )
-
-    elif rule_type in {
-        "at_least_one_present",
-        "columns_equal",
-    }:
-        columns.extend(
-            parameters.get(
-                "columns",
-                [],
-            )
-        )
-
-    cleaned = []
-
-    for column in columns:
-        if (
-            column
-            and column not in cleaned
-        ):
-            cleaned.append(column)
-
-    return cleaned
-
-
-# ---------------------------------------------------------------------
-# Guardrails
-# ---------------------------------------------------------------------
-
-def validate_rule(
-    rule,
-    valid_columns,
+def executable_signature(
+    executable_rule,
 ):
-    if not isinstance(
-        rule,
-        dict,
-    ):
-        return (
-            False,
-            "Rule is not an object.",
-            rule,
-        )
 
-    executable_rule = rule.get(
-        "executable_rule"
-    )
-
-    if not isinstance(
-        executable_rule,
-        dict,
-    ):
-        return (
-            False,
-            "Missing executable_rule.",
-            rule,
-        )
-
-    rule_type = executable_rule.get(
-        "type"
-    )
-
-    if rule_type not in SUPPORTED_RULE_TYPES:
-        return (
-            False,
-            f"Unsupported rule type: {rule_type}",
-            rule,
-        )
-
-    parameters = executable_rule.get(
-        "parameters",
-        {},
-    )
-
-    if not isinstance(
-        parameters,
-        dict,
-    ):
-        return (
-            False,
-            "parameters must be an object.",
-            rule,
-        )
-
-    referenced_columns = get_referenced_columns(
-        rule
-    )
-
-    if len(
-        set(referenced_columns)
-    ) < 2:
-        return (
-            False,
-            "Rule must reference at least two distinct columns.",
-            rule,
-        )
-
-    bad_columns = [
-        column
-        for column in referenced_columns
-        if column not in valid_columns
-    ]
-
-    if bad_columns:
-        return (
-            False,
-            f"Unknown columns: {bad_columns}",
-            rule,
-        )
-
-    if rule_type == "column_comparison":
-        left = parameters.get(
-            "left_column"
-        )
-
-        right = parameters.get(
-            "right_column"
-        )
-
-        operator = parameters.get(
-            "operator"
-        )
-
-        if left == right:
-            return (
-                False,
-                "A column cannot be compared to itself.",
-                rule,
-            )
-
-        if operator not in SUPPORTED_COMPARISON_OPERATORS:
-            return (
-                False,
-                f"Unsupported operator: {operator}",
-                rule,
-            )
-
-        null_behavior = parameters.get(
-            "null_behavior",
-            "ignore",
-        )
-
-        if null_behavior not in {
-            "ignore",
-            "fail",
-        }:
-            return (
-                False,
-                f"Unsupported null behavior: {null_behavior}",
-                rule,
-            )
-
-    elif rule_type == "conditional_required":
-        if parameters.get(
-            "condition_operator"
-        ) != "==":
-            return (
-                False,
-                "conditional_required supports only ==.",
-                rule,
-            )
-
-        if "condition_value" not in parameters:
-            return (
-                False,
-                "condition_value is required.",
-                rule,
-            )
-
-    elif rule_type in {
-        "at_least_one_present",
-        "columns_equal",
-    }:
-        columns = parameters.get(
-            "columns"
-        )
-
-        if not isinstance(
-            columns,
-            list,
-        ):
-            return (
-                False,
-                "columns must be a list.",
-                rule,
-            )
-
-        if len(
-            set(columns)
-        ) < 2:
-            return (
-                False,
-                "Rule needs at least two distinct columns.",
-                rule,
-            )
-
-    try:
-        confidence = float(
-            rule.get(
-                "confidence_score",
-                0,
-            )
-        )
-
-    except (
-        ValueError,
-        TypeError,
-    ):
-        return (
-            False,
-            "confidence_score must be numeric.",
-            rule,
-        )
-
-    if confidence < MIN_CONFIDENCE:
-        return (
-            False,
-            f"Confidence too low: {confidence}",
-            rule,
-        )
-
-    if confidence > 1:
-        return (
-            False,
-            "confidence_score cannot exceed 1.",
-            rule,
-        )
-
-    rule[
-        "target_columns"
-    ] = referenced_columns
-
-    return (
-        True,
-        None,
-        rule,
-    )
-
-
-# ---------------------------------------------------------------------
-# Duplicate detection
-# ---------------------------------------------------------------------
-
-def executable_signature(rule):
     return json.dumps(
-        rule.get(
-            "executable_rule",
-            {},
-        ),
+        executable_rule,
         sort_keys=True,
         default=str,
     )
 
 
-def get_existing_signatures(existing_rules):
+def existing_rule_signatures(
+    existing_rules,
+):
+
     signatures = set()
 
     for rule in existing_rules:
+
         definition = rule[
             "rule_definition"
         ]
@@ -967,10 +940,14 @@ def get_existing_signatures(existing_rules):
             definition,
             str,
         ):
+
             try:
-                definition = json.loads(
-                    definition
+                definition = (
+                    json.loads(
+                        definition
+                    )
                 )
+
             except json.JSONDecodeError:
                 continue
 
@@ -980,24 +957,533 @@ def get_existing_signatures(existing_rules):
         ):
             continue
 
-        signatures.add(
-            executable_signature(
-                definition
+        executable_rule = (
+            definition.get(
+                "executable_rule"
             )
         )
+
+        if executable_rule:
+
+            signatures.add(
+                executable_signature(
+                    executable_rule
+                )
+            )
 
     return signatures
 
 
-# ---------------------------------------------------------------------
-# Insert
-# ---------------------------------------------------------------------
+# ============================================================
+# Prompt
+# ============================================================
+
+def build_candidate_prompt(
+    dataset,
+    candidate,
+    profile_map,
+):
+
+    left_column = candidate[
+        "left_column"
+    ]
+
+    right_column = candidate[
+        "right_column"
+    ]
+
+    profiles = [
+        compact_profile(
+            profile_map[
+                left_column
+            ]
+        ),
+
+        compact_profile(
+            profile_map[
+                right_column
+            ]
+        ),
+    ]
+
+    allowed_rule_types = sorted(
+        candidate[
+            "allowed_rule_types"
+        ]
+    )
+
+    return f"""
+You are a senior enterprise data steward.
+
+Evaluate ONE proposed relationship between exactly TWO columns.
+
+Do not search for unrelated rules.
+
+Dataset:
+{dataset['dataset_name']}
+
+Dataset description:
+{dataset.get('description')}
+
+Candidate relationship type:
+{candidate['candidate_type']}
+
+Why this candidate was selected:
+{candidate['reason']}
+
+Empirical evidence from the actual dataset:
+{json.dumps(
+    candidate.get("empirical_evidence"),
+    indent=2,
+    default=str
+)}
+
+Columns:
+{json.dumps(profiles, indent=2, default=str)}
+
+Allowed executable rule types for THIS candidate:
+{json.dumps(allowed_rule_types)}
+
+Your job:
+
+Determine whether the available column names, inferred types, null patterns,
+and sample values provide sufficient evidence for a deterministic,
+reusable business data quality relationship.
+
+IMPORTANT:
+
+- Do not invent business requirements.
+- Related fields do NOT automatically have to be populated.
+- Fields belonging to the same entity do NOT automatically have to be equal.
+- Address, city, state, ZIP, and country fields should NOT be equal simply
+  because they describe the same location.
+- If the evidence is not strong enough, return accepted=false.
+- Do not explain anything outside the JSON object.
+- Do not generate SQL.
+- Only use one of the allowed executable rule types.
+
+Return exactly:
+
+{{
+  "accepted": false,
+  "business_definition": "",
+  "confidence_score": 0.0,
+  "evidence": "",
+  "target_columns": [],
+  "executable_rule": {{
+    "type": "",
+    "parameters": {{}}
+  }}
+}}
+
+If no defensible relationship exists:
+
+{{
+  "accepted": false,
+  "business_definition": "",
+  "confidence_score": 0.0,
+  "evidence": "",
+  "target_columns": [],
+  "executable_rule": {{
+    "type": "none",
+    "parameters": {{}}
+  }}
+}}
+
+If empirical evidence is supplied, treat it as observed evidence from
+the actual dataset.
+
+Do not accept the rule solely because current records happen to follow
+the pattern. Accept it only if the observed relationship also makes
+semantic business sense based on the field meanings.
+
+When empirical evidence is present:
+
+- Treat observed support above 95% as strong statistical evidence.
+- Treat observed support above 99% across at least 100 comparable rows as very strong evidence.
+- Do not reject a candidate merely because the relationship was not explicitly stated as a business policy.
+- Reject only when the proposed relationship is semantically implausible, unsupported by field meaning, or likely coincidental.
+- The purpose of this review is to determine whether the empirically observed relationship is reasonable enough to propose for human steward approval.
+
+Return valid JSON only.
+"""
+
+
+# ============================================================
+# Guardrails
+# ============================================================
+
+def referenced_columns(
+    executable_rule,
+):
+
+    rule_type = executable_rule.get(
+        "type"
+    )
+
+    parameters = executable_rule.get(
+        "parameters",
+        {}
+    )
+
+    if rule_type == "column_comparison":
+
+        return [
+            parameters.get(
+                "left_column"
+            ),
+            parameters.get(
+                "right_column"
+            ),
+        ]
+
+    if rule_type == "conditional_required":
+
+        return [
+            parameters.get(
+                "condition_column"
+            ),
+            parameters.get(
+                "required_column"
+            ),
+        ]
+
+    if rule_type in {
+        "at_least_one_present",
+        "columns_equal",
+    }:
+
+        return parameters.get(
+            "columns",
+            []
+        )
+
+    return []
+
+
+def validate_candidate_response(
+    response,
+    candidate,
+    profile_map,
+):
+
+    if not isinstance(
+        response,
+        dict,
+    ):
+
+        return (
+            False,
+            "Response is not a JSON object.",
+            None,
+        )
+
+    if not response.get(
+        "accepted",
+        False,
+    ):
+
+        return (
+            False,
+            "LLM rejected candidate.",
+            None,
+        )
+
+    try:
+
+        confidence = float(
+            response.get(
+                "confidence_score",
+                0,
+            )
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return (
+            False,
+            "Invalid confidence score.",
+            None,
+        )
+
+    if confidence < MIN_CONFIDENCE:
+
+        return (
+            False,
+            (
+                "Confidence below threshold: "
+                f"{confidence}"
+            ),
+            None,
+        )
+
+    executable_rule = response.get(
+        "executable_rule",
+        {}
+    )
+
+    rule_type = executable_rule.get(
+        "type"
+    )
+
+    if rule_type not in SUPPORTED_RULE_TYPES:
+
+        return (
+            False,
+            (
+                "Unsupported rule type: "
+                f"{rule_type}"
+            ),
+            None,
+        )
+
+    if rule_type not in candidate[
+        "allowed_rule_types"
+    ]:
+
+        return (
+            False,
+            (
+                f"Rule type {rule_type} is not "
+                "allowed for this candidate."
+            ),
+            None,
+        )
+
+    columns = [
+        column
+        for column in referenced_columns(
+            executable_rule
+        )
+        if column
+    ]
+
+    expected_columns = {
+        candidate[
+            "left_column"
+        ],
+        candidate[
+            "right_column"
+        ],
+    }
+
+    if set(columns) != expected_columns:
+
+        return (
+            False,
+            (
+                "Rule does not reference exactly "
+                "the candidate columns."
+            ),
+            None,
+        )
+
+    # --------------------------------------------------------
+    # Column comparison validation
+    # --------------------------------------------------------
+
+    if rule_type == "column_comparison":
+
+        parameters = executable_rule[
+            "parameters"
+        ]
+
+        operator = parameters.get(
+            "operator"
+        )
+
+        if operator not in SUPPORTED_OPERATORS:
+
+            return (
+                False,
+                (
+                    "Unsupported comparison "
+                    f"operator: {operator}"
+                ),
+                None,
+            )
+
+        left = parameters.get(
+            "left_column"
+        )
+
+        right = parameters.get(
+            "right_column"
+        )
+
+        left_type = normalize_type(
+            profile_map[
+                left
+            ]["inferred_type"]
+        )
+
+        right_type = normalize_type(
+            profile_map[
+                right
+            ]["inferred_type"]
+        )
+
+        if left_type != right_type:
+
+            return (
+                False,
+                (
+                    "Column comparison uses "
+                    "incompatible types."
+                ),
+                None,
+            )
+
+        if (
+            operator
+            in {
+                "<",
+                "<=",
+                ">",
+                ">=",
+            }
+            and left_type
+            not in {
+                "numeric",
+                "date",
+            }
+        ):
+
+            return (
+                False,
+                (
+                    "Ordered comparisons require "
+                    "numeric or date columns."
+                ),
+                None,
+            )
+
+    # --------------------------------------------------------
+    # Conditional required validation
+    # --------------------------------------------------------
+
+    if rule_type == "conditional_required":
+
+        parameters = executable_rule[
+            "parameters"
+        ]
+
+        if parameters.get(
+            "condition_operator"
+        ) != "==":
+
+            return (
+                False,
+                (
+                    "conditional_required supports "
+                    "only ==."
+                ),
+                None,
+            )
+
+        if "condition_value" not in parameters:
+
+            return (
+                False,
+                (
+                    "conditional_required is missing "
+                    "condition_value."
+                ),
+                None,
+            )
+
+    # --------------------------------------------------------
+    # At least one present
+    # --------------------------------------------------------
+
+    if rule_type == "at_least_one_present":
+
+        parameters = executable_rule[
+            "parameters"
+        ]
+
+        if not isinstance(
+            parameters.get(
+                "columns"
+            ),
+            list,
+        ):
+
+            return (
+                False,
+                "columns parameter must be a list.",
+                None,
+            )
+
+    # --------------------------------------------------------
+    # Columns equal
+    # --------------------------------------------------------
+
+    if rule_type == "columns_equal":
+
+        # Critical semantic guardrail:
+        # only candidates created as duplicate semantic fields
+        # may ever become equality rules.
+
+        if (
+            candidate[
+                "candidate_type"
+            ]
+            != "duplicate_semantic_field"
+        ):
+
+            return (
+                False,
+                (
+                    "columns_equal rejected because "
+                    "candidate fields are not semantic duplicates."
+                ),
+                None,
+            )
+
+    cleaned_rule = {
+        "business_definition":
+            response.get(
+                "business_definition",
+                ""
+            ),
+
+        "confidence_score":
+            confidence,
+
+        "evidence":
+            response.get(
+                "evidence",
+                ""
+            ),
+
+        "target_columns":
+            columns,
+
+        "executable_rule":
+            executable_rule,
+    }
+
+    return (
+        True,
+        None,
+        cleaned_rule,
+    )
+
+
+# ============================================================
+# Insert rule
+# ============================================================
 
 def insert_rule(
     conn,
     dataset_name,
     rule,
 ):
+
     conn.execute(
         text("""
             INSERT INTO dq.rule
@@ -1028,30 +1514,42 @@ def insert_rule(
             )
         """),
         {
-            "dataset_name": dataset_name,
-            "rule_definition": json.dumps(
-                rule
-            ),
-            "target_columns": json.dumps(
-                rule["target_columns"]
-            ),
-            "llm_provider": LLM_PROVIDER,
-            "llm_model": LLM_MODEL,
-            "prompt_version": (
-                "multicolumn-candidate-v2"
-            ),
+            "dataset_name":
+                dataset_name,
+
+            "rule_definition":
+                json.dumps(
+                    rule
+                ),
+
+            "target_columns":
+                json.dumps(
+                    rule[
+                        "target_columns"
+                    ]
+                ),
+
+            "llm_provider":
+                LLM_PROVIDER,
+
+            "llm_model":
+                LLM_MODEL,
+
+            "prompt_version":
+                "multicolumn-pair-v4",
         },
     )
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # Main
-# ---------------------------------------------------------------------
+# ============================================================
 
 def main():
+
     print(
-        f"Analyzing multi-column relationships for "
-        f"dataset: {DATASET_NAME}"
+        f"Analyzing multi-column relationships "
+        f"for dataset: {DATASET_NAME}"
     )
 
     print(
@@ -1062,13 +1560,19 @@ def main():
         f"LLM model: {LLM_MODEL}"
     )
 
+    # --------------------------------------------------------
+    # Load metadata
+    # --------------------------------------------------------
+
     with engine.begin() as conn:
+
         dataset = get_dataset(
             conn,
             DATASET_NAME,
         )
 
         if dataset is None:
+
             raise ValueError(
                 f"Dataset not found or inactive: "
                 f"{DATASET_NAME}"
@@ -1084,8 +1588,9 @@ def main():
         )
 
         if not profiles:
+
             raise ValueError(
-                f"No profiles exist for "
+                f"No column profiles exist for "
                 f"{DATASET_NAME}. "
                 "Run profiling first."
             )
@@ -1095,198 +1600,379 @@ def main():
             DATASET_NAME,
         )
 
-    groups = discover_candidate_groups(
+    profile_map = {
+        profile["column_name"]:
+            profile
+        for profile in profiles
+    }
+
+    raw_schema = dataset.get(
+        "raw_schema",
+        "raw"
+    )
+
+    raw_table = dataset.get(
+        "raw_table",
+        DATASET_NAME
+    )
+
+    df = pd.read_sql(
+        f'SELECT * FROM "{raw_schema}"."{raw_table}"',
+        engine
+    )
+
+    print(
+        f"Raw rows available for empirical analysis: "
+        f"{len(df)}"
+    )
+
+    # --------------------------------------------------------
+    # Discover candidates
+    # --------------------------------------------------------
+
+    candidates = discover_candidates(
         profiles
     )
 
+    print()
     print(
-        f"Columns available: {len(profiles)}"
+        f"Columns analyzed: "
+        f"{len(profiles)}"
     )
 
     print(
-        f"Candidate groups discovered: {len(groups)}"
+        f"Relationship candidates selected: "
+        f"{len(candidates)}"
     )
 
-    print(
-        f"Existing active rules: {len(existing_rules)}"
-    )
+    if not candidates:
 
-    if not groups:
         print(
-            "No candidate multi-column groups were discovered."
+            "No strong multi-column candidates "
+            "were discovered."
         )
+
         return
 
-    existing_signatures = get_existing_signatures(
-        existing_rules
+    print()
+    print(
+        "Candidate ranking:"
     )
 
-    inserted_signatures = set()
+    for index, candidate in enumerate(
+        candidates,
+        start=1,
+    ):
 
-    total_proposed = 0
-    total_inserted = 0
+        print(
+            f"{index}. "
+            f"Score {candidate['score']} | "
+            f"{candidate['candidate_type']} | "
+            f"{candidate['left_column']} <-> "
+            f"{candidate['right_column']}"
+        )
+
+    existing_signatures = (
+        existing_rule_signatures(
+            existing_rules
+        )
+    )
+
+    newly_inserted_signatures = set()
+
+    total_accepted = 0
     total_rejected = 0
+    total_inserted = 0
     total_duplicates = 0
-    total_failed_groups = 0
+    total_llm_errors = 0
+
+    # --------------------------------------------------------
+    # Analyze each candidate
+    # --------------------------------------------------------
 
     with engine.begin() as conn:
 
-        for group_number, group in enumerate(
-            groups,
+        for number, candidate in enumerate(
+            candidates,
             start=1,
         ):
+
             print()
             print(
-                f"Group {group_number}/{len(groups)}"
+                "----------------------------------------"
             )
 
             print(
-                f"Reason: {group['reason']}"
+                f"Candidate "
+                f"{number}/{len(candidates)}"
             )
 
             print(
-                "Columns: "
-                + ", ".join(
-                    group["columns"]
+                f"Score: "
+                f"{candidate['score']}"
+            )
+
+            print(
+                f"Type: "
+                f"{candidate['candidate_type']}"
+            )
+
+            print(
+                f"Columns: "
+                f"{candidate['left_column']} "
+                f"<-> "
+                f"{candidate['right_column']}"
+            )
+
+            print(
+                f"Reason: "
+                f"{candidate['reason']}"
+            )
+###########
+            empirical_evidence = None
+
+            if candidate["candidate_type"] == "date_relationship":
+
+                empirical_evidence = analyze_date_relationship(
+                    df,
+                    candidate["left_column"],
+                    candidate["right_column"],
                 )
+
+                if empirical_evidence is None:
+
+                    print(
+                        "Candidate skipped: "
+                        "not enough comparable date records."
+                    )
+
+                    continue
+
+                print(
+                    "Observed relationship:"
+                )
+
+                print(
+                    f"  {empirical_evidence['left_column']} "
+                    f"{empirical_evidence['operator']} "
+                    f"{empirical_evidence['right_column']}"
+                )
+
+                print(
+                    f"  Comparable rows: "
+                    f"{empirical_evidence['comparable_rows']}"
+                )
+
+                print(
+                    f"  Passed rows: "
+                    f"{empirical_evidence['passed_rows']}"
+                )
+
+                print(
+                    f"  Failed rows: "
+                    f"{empirical_evidence['failed_rows']}"
+                )
+
+                print(
+                    f"  Observed support: "
+                    f"{empirical_evidence['support']:.2%}"
+                )
+
+                if (
+                    empirical_evidence["support"]
+                    < MIN_OBSERVED_SUPPORT
+                ):
+
+                    print(
+                        "Candidate skipped: "
+                        f"observed support below "
+                        f"{MIN_OBSERVED_SUPPORT:.0%}."
+                    )
+
+                    continue
+
+                # Replace the original pair ordering with the
+                # empirically supported ordering.
+                candidate = dict(
+                    candidate
+                )
+
+                candidate[
+                    "left_column"
+                ] = empirical_evidence[
+                    "left_column"
+                ]
+
+                candidate[
+                    "right_column"
+                ] = empirical_evidence[
+                    "right_column"
+                ]
+
+                candidate[
+                    "empirical_evidence"
+                ] = empirical_evidence
+
+
+            prompt = build_candidate_prompt(
+                dataset,
+                candidate,
+                profile_map,
             )
 
-            prompt = build_group_prompt(
-                dataset,
-                group,
-                profiles,
-                existing_rules,
-            )
+            # ------------------------------------------------
+            # LLM call
+            # ------------------------------------------------
 
             try:
+
                 response = generate_json(
                     prompt
                 )
 
             except LLMError as exc:
-                total_failed_groups += 1
+
+                total_llm_errors += 1
 
                 print(
-                    f"Group skipped: LLM error: {exc}"
+                    f"LLM error: {exc}"
                 )
 
                 continue
 
-            rules = response.get(
-                "rules",
-                []
+            # ------------------------------------------------
+            # Guardrails
+            # ------------------------------------------------
+
+            valid, reason, rule = (
+                validate_candidate_response(
+                    response,
+                    candidate,
+                    profile_map,
+                )
             )
 
-            if not isinstance(
-                rules,
-                list,
+            if not valid:
+
+                total_rejected += 1
+
+                print(
+                    f"Candidate rejected: "
+                    f"{reason}"
+                )
+
+                continue
+
+            total_accepted += 1
+
+            signature = (
+                executable_signature(
+                    rule[
+                        "executable_rule"
+                    ]
+                )
+            )
+
+            if (
+                signature
+                in existing_signatures
+                or signature
+                in newly_inserted_signatures
             ):
-                total_failed_groups += 1
+
+                total_duplicates += 1
 
                 print(
-                    "Group skipped: response did not contain a rules list."
+                    "Duplicate rule skipped."
                 )
 
                 continue
 
-            rules = rules[
-                :MAX_RULES_PER_GROUP
-            ]
+            # ------------------------------------------------
+            # Insert
+            # ------------------------------------------------
 
-            if not rules:
-                print(
-                    "No relationships proposed."
-                )
-                continue
-
-            group_columns = set(
-                group["columns"]
+            insert_rule(
+                conn,
+                DATASET_NAME,
+                rule,
             )
 
-            for rule in rules:
-                total_proposed += 1
+            newly_inserted_signatures.add(
+                signature
+            )
 
-                valid, reason, cleaned = validate_rule(
-                    rule,
-                    group_columns,
-                )
+            total_inserted += 1
 
-                if not valid:
-                    total_rejected += 1
+            print(
+                "Inserted proposed ROW rule:"
+            )
 
-                    print(
-                        f"Rejected: {reason}"
-                    )
+            print(
+                f"  Type: "
+                f"{rule['executable_rule']['type']}"
+            )
 
-                    continue
+            print(
+                f"  Columns: "
+                f"{rule['target_columns']}"
+            )
 
-                signature = executable_signature(
-                    cleaned
-                )
+            print(
+                f"  Confidence: "
+                f"{rule['confidence_score']}"
+            )
 
-                if (
-                    signature in existing_signatures
-                    or signature in inserted_signatures
-                ):
-                    total_duplicates += 1
-
-                    print(
-                        "Duplicate skipped."
-                    )
-
-                    continue
-
-                insert_rule(
-                    conn,
-                    DATASET_NAME,
-                    cleaned,
-                )
-
-                inserted_signatures.add(
-                    signature
-                )
-
-                total_inserted += 1
-
-                print(
-                    "Inserted: "
-                    f"{cleaned['executable_rule']['type']} "
-                    f"{cleaned['target_columns']}"
-                )
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
 
     print()
     print(
         "========================================"
     )
+
     print(
         "Multi-column analysis complete"
     )
+
     print(
         "========================================"
     )
 
     print(
-        f"Candidate groups: {len(groups)}"
+        f"Columns analyzed: "
+        f"{len(profiles)}"
     )
 
     print(
-        f"Groups with LLM errors: {total_failed_groups}"
+        f"Candidates sent to LLM: "
+        f"{len(candidates)}"
     )
 
     print(
-        f"Rules proposed: {total_proposed}"
+        f"LLM errors: "
+        f"{total_llm_errors}"
     )
 
     print(
-        f"Rules inserted: {total_inserted}"
+        f"Candidates accepted: "
+        f"{total_accepted}"
     )
 
     print(
-        f"Guardrail rejections: {total_rejected}"
+        f"Candidates rejected: "
+        f"{total_rejected}"
     )
 
     print(
-        f"Duplicates skipped: {total_duplicates}"
+        f"Rules inserted: "
+        f"{total_inserted}"
+    )
+
+    print(
+        f"Duplicates skipped: "
+        f"{total_duplicates}"
     )
 
 
