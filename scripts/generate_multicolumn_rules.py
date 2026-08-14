@@ -27,7 +27,10 @@ from llm_client import (
     generate_json,
 )
 
-
+from rule_registry import (
+    get_rule_types,
+    validate_executable_rule,
+)
 # ============================================================
 # Configuration
 # ============================================================
@@ -37,21 +40,21 @@ MIN_CONFIDENCE = 0.75
 MIN_OBSERVED_SUPPORT = 0.95
 MIN_COMPARABLE_ROWS = 25
 
-SUPPORTED_RULE_TYPES = {
-    "column_comparison",
-    "conditional_required",
-    "at_least_one_present",
-    "columns_equal",
-}
-
-SUPPORTED_OPERATORS = {
-    "==",
-    "!=",
-    "<",
-    "<=",
-    ">",
-    ">=",
-}
+# SUPPORTED_RULE_TYPES = {
+    # "column_comparison",
+    # "conditional_required",
+    # "at_least_one_present",
+    # "columns_equal",
+# }
+#
+# SUPPORTED_OPERATORS = {
+    # "==",
+    # "!=",
+    # "<",
+    # "<=",
+    # ">",
+    # ">=",
+# }
 
 
 # ============================================================
@@ -1166,31 +1169,47 @@ def validate_candidate_response(
     candidate,
     profile_map,
 ):
+    """
+    Validate an LLM response for a multi-column candidate.
 
-    if not isinstance(
-        response,
-        dict,
-    ):
+    Validation layers:
 
+    1. Confirm the LLM accepted the candidate.
+    2. Enforce confidence threshold.
+    3. Validate executable_rule against the central rule registry.
+    4. Confirm the rule is allowed for this candidate type.
+    5. Confirm the rule references exactly the candidate columns.
+    6. Apply candidate-specific semantic/type guardrails.
+    7. Return a cleaned rule ready for insertion into dq.rule.
+    """
+
+    # ============================================================
+    # Basic response validation
+    # ============================================================
+
+    if not isinstance(response, dict):
         return (
             False,
-            "Response is not a JSON object.",
+            "LLM response is not a JSON object.",
             None,
         )
 
-    if not response.get(
-        "accepted",
-        False,
-    ):
+    # ------------------------------------------------------------
+    # Candidate acceptance
+    # ------------------------------------------------------------
 
+    if not response.get("accepted", False):
         return (
             False,
             "LLM rejected candidate.",
             None,
         )
 
-    try:
+    # ------------------------------------------------------------
+    # Confidence score
+    # ------------------------------------------------------------
 
+    try:
         confidence = float(
             response.get(
                 "confidence_score",
@@ -1198,60 +1217,116 @@ def validate_candidate_response(
             )
         )
 
-    except (
-        TypeError,
-        ValueError,
-    ):
-
+    except (TypeError, ValueError):
         return (
             False,
-            "Invalid confidence score.",
+            "confidence_score must be numeric.",
+            None,
+        )
+
+    if not 0.0 <= confidence <= 1.0:
+        return (
+            False,
+            (
+                "confidence_score must be between "
+                "0.0 and 1.0."
+            ),
             None,
         )
 
     if confidence < MIN_CONFIDENCE:
-
         return (
             False,
             (
-                "Confidence below threshold: "
-                f"{confidence}"
+                f"Confidence below threshold: "
+                f"{confidence:.2f} "
+                f"< {MIN_CONFIDENCE:.2f}"
             ),
             None,
         )
+
+    # ============================================================
+    # Executable rule
+    # ============================================================
 
     executable_rule = response.get(
-        "executable_rule",
-        {}
+        "executable_rule"
     )
 
-    rule_type = executable_rule.get(
+    if not isinstance(
+        executable_rule,
+        dict,
+    ):
+        return (
+            False,
+            "Response is missing executable_rule.",
+            None,
+        )
+
+    # ------------------------------------------------------------
+    # Central Rule Registry validation
+    #
+    # THIS replaces the old local:
+    #
+    # SUPPORTED_RULE_TYPES
+    # SUPPORTED_OPERATORS
+    #
+    # validation.
+    # ------------------------------------------------------------
+
+    valid, reason, cleaned_executable_rule = (
+        validate_executable_rule(
+            executable_rule,
+            expected_scope="ROW",
+        )
+    )
+
+    if not valid:
+        return (
+            False,
+            (
+                "Rule registry validation failed: "
+                f"{reason}"
+            ),
+            None,
+        )
+
+    executable_rule = (
+        cleaned_executable_rule
+    )
+
+    rule_type = executable_rule[
         "type"
+    ]
+
+    parameters = executable_rule[
+        "parameters"
+    ]
+
+    # ============================================================
+    # Candidate-specific rule restriction
+    # ============================================================
+
+    allowed_rule_types = candidate.get(
+        "allowed_rule_types",
+        set(),
     )
 
-    if rule_type not in SUPPORTED_RULE_TYPES:
-
+    if rule_type not in allowed_rule_types:
         return (
             False,
             (
-                "Unsupported rule type: "
-                f"{rule_type}"
+                f"Rule type '{rule_type}' is valid "
+                "in the registry, but is not allowed "
+                "for this candidate type "
+                f"'{candidate.get('candidate_type')}'."
             ),
             None,
         )
 
-    if rule_type not in candidate[
-        "allowed_rule_types"
-    ]:
-
-        return (
-            False,
-            (
-                f"Rule type {rule_type} is not "
-                "allowed for this candidate."
-            ),
-            None,
-        )
+    # ============================================================
+    # Determine referenced columns
+    # ============================================================
 
     columns = [
         column
@@ -1260,6 +1335,12 @@ def validate_candidate_response(
         )
         if column
     ]
+
+    # Remove duplicates while preserving order.
+
+    columns = list(
+        dict.fromkeys(columns)
+    )
 
     expected_columns = {
         candidate[
@@ -1271,71 +1352,92 @@ def validate_candidate_response(
     }
 
     if set(columns) != expected_columns:
-
         return (
             False,
             (
-                "Rule does not reference exactly "
-                "the candidate columns."
+                "Rule must reference exactly the "
+                "two candidate columns. "
+                f"Expected: {sorted(expected_columns)}. "
+                f"Received: {sorted(columns)}."
             ),
             None,
         )
 
-    # --------------------------------------------------------
-    # Column comparison validation
-    # --------------------------------------------------------
+    # ============================================================
+    # Candidate-specific semantic guardrails
+    # ============================================================
+
+    # ------------------------------------------------------------
+    # column_comparison
+    # ------------------------------------------------------------
 
     if rule_type == "column_comparison":
 
-        parameters = executable_rule[
-            "parameters"
+        left_column = parameters[
+            "left_column"
         ]
 
-        operator = parameters.get(
+        right_column = parameters[
+            "right_column"
+        ]
+
+        operator = parameters[
             "operator"
+        ]
+
+        if left_column == right_column:
+            return (
+                False,
+                "A column cannot be compared with itself.",
+                None,
+            )
+
+        left_profile = profile_map.get(
+            left_column
         )
 
-        if operator not in SUPPORTED_OPERATORS:
+        right_profile = profile_map.get(
+            right_column
+        )
 
+        if (
+            left_profile is None
+            or right_profile is None
+        ):
             return (
                 False,
                 (
-                    "Unsupported comparison "
-                    f"operator: {operator}"
+                    "Unable to locate column profile "
+                    "for comparison rule."
                 ),
                 None,
             )
 
-        left = parameters.get(
-            "left_column"
-        )
-
-        right = parameters.get(
-            "right_column"
-        )
-
         left_type = normalize_type(
-            profile_map[
-                left
-            ]["inferred_type"]
+            left_profile[
+                "inferred_type"
+            ]
         )
 
         right_type = normalize_type(
-            profile_map[
-                right
-            ]["inferred_type"]
+            right_profile[
+                "inferred_type"
+            ]
         )
 
-        if left_type != right_type:
+        # The compared fields should represent compatible types.
 
+        if left_type != right_type:
             return (
                 False,
                 (
-                    "Column comparison uses "
-                    "incompatible types."
+                    "Column comparison uses incompatible "
+                    f"types: {left_type} vs {right_type}."
                 ),
                 None,
             )
+
+        # Ordered comparisons only make sense for date/numeric data.
 
         if (
             operator
@@ -1351,104 +1453,180 @@ def validate_candidate_response(
                 "date",
             }
         ):
-
             return (
                 False,
                 (
-                    "Ordered comparisons require "
-                    "numeric or date columns."
+                    "Ordered column comparisons require "
+                    "numeric or date-compatible columns."
                 ),
                 None,
             )
 
-    # --------------------------------------------------------
-    # Conditional required validation
-    # --------------------------------------------------------
+        # --------------------------------------------------------
+        # Empirical relationship enforcement
+        #
+        # If Python already established an observed date ordering,
+        # the LLM cannot reverse or change it.
+        # --------------------------------------------------------
 
-    if rule_type == "conditional_required":
-
-        parameters = executable_rule[
-            "parameters"
-        ]
-
-        if parameters.get(
-            "condition_operator"
-        ) != "==":
-
-            return (
-                False,
-                (
-                    "conditional_required supports "
-                    "only ==."
-                ),
-                None,
-            )
-
-        if "condition_value" not in parameters:
-
-            return (
-                False,
-                (
-                    "conditional_required is missing "
-                    "condition_value."
-                ),
-                None,
-            )
-
-    # --------------------------------------------------------
-    # At least one present
-    # --------------------------------------------------------
-
-    if rule_type == "at_least_one_present":
-
-        parameters = executable_rule[
-            "parameters"
-        ]
-
-        if not isinstance(
-            parameters.get(
-                "columns"
-            ),
-            list,
-        ):
-
-            return (
-                False,
-                "columns parameter must be a list.",
-                None,
-            )
-
-    # --------------------------------------------------------
-    # Columns equal
-    # --------------------------------------------------------
-
-    if rule_type == "columns_equal":
-
-        # Critical semantic guardrail:
-        # only candidates created as duplicate semantic fields
-        # may ever become equality rules.
+        empirical_evidence = candidate.get(
+            "empirical_evidence"
+        )
 
         if (
-            candidate[
+            empirical_evidence
+            and candidate.get(
                 "candidate_type"
-            ]
-            != "duplicate_semantic_field"
+            )
+            == "date_relationship"
         ):
 
+            expected_left = (
+                empirical_evidence[
+                    "left_column"
+                ]
+            )
+
+            expected_operator = (
+                empirical_evidence[
+                    "operator"
+                ]
+            )
+
+            expected_right = (
+                empirical_evidence[
+                    "right_column"
+                ]
+            )
+
+            if (
+                left_column != expected_left
+                or operator != expected_operator
+                or right_column != expected_right
+            ):
+                return (
+                    False,
+                    (
+                        "LLM comparison does not match "
+                        "the empirically observed "
+                        "relationship. "
+                        f"Expected: "
+                        f"{expected_left} "
+                        f"{expected_operator} "
+                        f"{expected_right}."
+                    ),
+                    None,
+                )
+
+    # ------------------------------------------------------------
+    # conditional_required
+    # ------------------------------------------------------------
+
+    elif rule_type == "conditional_required":
+
+        condition_column = parameters[
+            "condition_column"
+        ]
+
+        required_column = parameters[
+            "required_column"
+        ]
+
+        if condition_column == required_column:
             return (
                 False,
                 (
-                    "columns_equal rejected because "
-                    "candidate fields are not semantic duplicates."
+                    "conditional_required cannot use "
+                    "the same column as both condition "
+                    "and required field."
                 ),
                 None,
             )
 
+    # ------------------------------------------------------------
+    # at_least_one_present
+    # ------------------------------------------------------------
+
+    elif rule_type == "at_least_one_present":
+
+        rule_columns = parameters[
+            "columns"
+        ]
+
+        if len(
+            set(rule_columns)
+        ) < 2:
+            return (
+                False,
+                (
+                    "at_least_one_present requires "
+                    "at least two distinct columns."
+                ),
+                None,
+            )
+
+    # ------------------------------------------------------------
+    # columns_equal
+    # ------------------------------------------------------------
+
+    elif rule_type == "columns_equal":
+
+        rule_columns = parameters[
+            "columns"
+        ]
+
+        if len(
+            set(rule_columns)
+        ) < 2:
+            return (
+                False,
+                (
+                    "columns_equal requires at least "
+                    "two distinct columns."
+                ),
+                None,
+            )
+
+        # Critical semantic guardrail:
+        #
+        # columns_equal is ONLY appropriate when Python identified
+        # the candidate as representing genuinely duplicate semantic
+        # fields.
+        #
+        # This prevents:
+        #
+        # address == city
+        # city == state
+        # state == zip
+        #
+        # even if an LLM proposes them.
+
+        if (
+            candidate.get(
+                "candidate_type"
+            )
+            != "duplicate_semantic_field"
+        ):
+            return (
+                False,
+                (
+                    "columns_equal is only permitted "
+                    "for duplicate semantic field "
+                    "candidates."
+                ),
+                None,
+            )
+
+    # ============================================================
+    # Build clean rule definition
+    # ============================================================
+
     cleaned_rule = {
+
         "business_definition":
             response.get(
                 "business_definition",
-                ""
+                "",
             ),
 
         "confidence_score":
@@ -1457,8 +1635,12 @@ def validate_candidate_response(
         "evidence":
             response.get(
                 "evidence",
-                ""
+                "",
             ),
+
+        # Never trust the LLM's target_columns field.
+        #
+        # Derive it ourselves from the validated executable rule.
 
         "target_columns":
             columns,
@@ -1466,6 +1648,23 @@ def validate_candidate_response(
         "executable_rule":
             executable_rule,
     }
+
+    # ------------------------------------------------------------
+    # Preserve empirical evidence in the rule itself.
+    #
+    # This will be valuable later in Rule Catalog, audit history,
+    # and the AI Steward Copilot.
+    # ------------------------------------------------------------
+
+    empirical_evidence = candidate.get(
+        "empirical_evidence"
+    )
+
+    if empirical_evidence:
+
+        cleaned_rule[
+            "empirical_evidence"
+        ] = empirical_evidence
 
     return (
         True,

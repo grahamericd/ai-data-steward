@@ -1,5 +1,7 @@
 import json
-import subprocess
+import urllib.error
+import urllib.request
+#import subprocess
 from typing import Any
 import logging
 
@@ -7,6 +9,7 @@ from config import (
     LLM_MODEL,
     LLM_PROVIDER,
     LLM_TIMEOUT_SECONDS,
+    OLLAMA_HOST,
     OPENAI_API_KEY,
 )
 
@@ -14,21 +17,77 @@ from config import (
 class LLMError(RuntimeError):
     """Raised when an LLM provider cannot return a usable response."""
 
+def _escape_control_chars_in_json_strings(text: str) -> str:
+    """
+    Escape raw newline, carriage-return, and tab characters
+    that appear inside quoted JSON strings.
+
+    LLMs occasionally return visually formatted JSON containing
+    literal line breaks inside string values, which is invalid JSON.
+    """
+
+    output = []
+
+    inside_string = False
+    escaped = False
+
+    for char in text:
+
+        if inside_string:
+
+            if escaped:
+                output.append(char)
+                escaped = False
+                continue
+
+            if char == "\\":
+                output.append(char)
+                escaped = True
+                continue
+
+            if char == '"':
+                output.append(char)
+                inside_string = False
+                continue
+
+            if char == "\n":
+                output.append("\\n")
+                continue
+
+            if char == "\r":
+                output.append("\\r")
+                continue
+
+            if char == "\t":
+                output.append("\\t")
+                continue
+
+            output.append(char)
+
+        else:
+
+            output.append(char)
+
+            if char == '"':
+                inside_string = True
+
+    return "".join(output)
 
 def _extract_json_object(response_text: str) -> dict:
     """
     Extract and parse a JSON object from an LLM response.
 
     Handles:
-    - pure JSON responses
+    - pure JSON
     - Markdown code fences
-    - explanatory text before or after the JSON
+    - explanatory prose before/after JSON
+    - raw control characters inside JSON strings
     """
 
     cleaned = response_text.strip()
 
     # ---------------------------------------------------------
-    # Remove Markdown code fences when present
+    # Remove Markdown code fences
     # ---------------------------------------------------------
 
     if cleaned.startswith("```"):
@@ -49,18 +108,22 @@ def _extract_json_object(response_text: str) -> dict:
             cleaned = cleaned[4:].strip()
 
     # ---------------------------------------------------------
-    # First try normal JSON parsing
+    # First try parsing the entire response.
+    #
+    # strict=False allows literal control characters such as
+    # newlines and tabs inside LLM-generated string values.
     # ---------------------------------------------------------
 
     try:
 
         parsed = json.loads(
-            cleaned
+            cleaned,
+            strict=False,
         )
 
         if not isinstance(
             parsed,
-            dict
+            dict,
         ):
             raise LLMError(
                 "The LLM response must be a JSON object."
@@ -72,8 +135,8 @@ def _extract_json_object(response_text: str) -> dict:
         pass
 
     # ---------------------------------------------------------
-    # Model may have included prose before/after JSON.
-    # Find the first complete JSON object.
+    # Model may have included prose before or after the JSON.
+    # Locate the first JSON object.
     # ---------------------------------------------------------
 
     start = cleaned.find("{")
@@ -81,81 +144,155 @@ def _extract_json_object(response_text: str) -> dict:
     if start == -1:
 
         raise LLMError(
-            "The LLM response did not contain a JSON object. "
-            f"Response begins with: {cleaned[:500]}"
+            "The LLM response did not contain a JSON object.\n\n"
+            f"FULL RESPONSE:\n{cleaned}"
         )
 
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(
+        strict=False
+    )
 
     try:
 
         parsed, end_position = decoder.raw_decode(
             cleaned[start:]
         )
-
-    except json.JSONDecodeError as exc:
         
+    except json.JSONDecodeError as exc:
+
+        error_start = max(
+            0,
+            exc.pos - 50
+        )
+
+        error_end = min(
+            len(cleaned),
+            exc.pos + 50
+        )
+
+        error_context = cleaned[
+            error_start:error_end
+        ]
+
         raise LLMError(
             "The LLM returned invalid JSON.\n\n"
             f"JSON ERROR: {exc}\n\n"
-            "FULL RESPONSE:\n"
-            f"{cleaned}"
+            f"ERROR POSITION: {exc.pos}\n\n"
+            f"ERROR CONTEXT REPR:\n"
+            f"{repr(error_context)}\n\n"
+            f"FULL RESPONSE:\n{cleaned}"
         ) from exc
 
+    # except json.JSONDecodeError as exc:
+
         # raise LLMError(
-            # "The LLM returned invalid JSON. "
-            # f"Response begins with: {cleaned[:500]}"
+            # "The LLM returned invalid JSON.\n\n"
+            # f"JSON ERROR: {exc}\n\n"
+            # f"FULL RESPONSE:\n{cleaned}"
         # ) from exc
 
-    if not isinstance(
-        parsed,
-        dict
-    ):
+    # if not isinstance(
+        # parsed,
+        # dict,
+    # ):
 
-        raise LLMError(
-            "The extracted LLM response must be a JSON object."
-        )
+        # raise LLMError(
+            # "The extracted LLM response must be a JSON object."
+        # )
 
     return parsed
 
 
 def _call_ollama(prompt: str) -> str:
-    """Call a locally installed Ollama model."""
+    """
+    Call Ollama through its local HTTP API.
+
+    Using the API instead of `ollama run` prevents terminal
+    control sequences from contaminating machine-readable output.
+    """
+
+    url = (
+        OLLAMA_HOST.rstrip("/")
+        + "/api/generate"
+    )
+
+    payload = {
+        "model": LLM_MODEL,
+        "prompt": prompt,
+        "stream": False,
+
+        # Tell Ollama we expect JSON output.
+        "format": "json",
+
+        "options": {
+            "temperature": 0.1,
+        },
+    }
+
+    request = urllib.request.Request(
+        url=url,
+        data=json.dumps(
+            payload
+        ).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
 
     try:
-        result = subprocess.run(
-            [
-                "ollama",
-                "run",
-                LLM_MODEL,
-            ],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=LLM_TIMEOUT_SECONDS,
-            check=False,
-        )
 
-    except subprocess.TimeoutExpired as exc:
+        with urllib.request.urlopen(
+            request,
+            timeout=LLM_TIMEOUT_SECONDS,
+        ) as response:
+
+            response_body = (
+                response
+                .read()
+                .decode("utf-8")
+            )
+
+    except TimeoutError as exc:
+
         raise LLMError(
             f"Ollama timed out after "
             f"{LLM_TIMEOUT_SECONDS} seconds."
         ) from exc
 
-    except FileNotFoundError as exc:
+    except urllib.error.URLError as exc:
+
         raise LLMError(
-            "The Ollama executable was not found."
+            f"Ollama API request failed: {exc}"
         ) from exc
 
-    if result.returncode != 0:
-        raise LLMError(
-            "Ollama request failed: "
-            f"{result.stderr.strip()}"
+    # ---------------------------------------------------------
+    # Parse the Ollama API envelope
+    # ---------------------------------------------------------
+
+    try:
+
+        api_response = json.loads(
+            response_body
         )
 
-    response_text = result.stdout.strip()
+    except json.JSONDecodeError as exc:
+
+        raise LLMError(
+            "Ollama returned an invalid API response."
+        ) from exc
+
+    response_text = (
+        api_response
+        .get(
+            "response",
+            ""
+        )
+        .strip()
+    )
 
     if not response_text:
+
         raise LLMError(
             "Ollama returned an empty response."
         )

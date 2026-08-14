@@ -13,6 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import RAW_DATA_DIR, engine
 from llm_client import LLMError, generate_json
 
+from rule_registry import (
+    build_llm_rule_catalog,
+    validate_executable_rule,
+)
 
 if len(sys.argv) != 2:
     print("Usage: python generate_rules.py <dataset_name>")
@@ -34,6 +38,10 @@ DATASET_NAME = sys.argv[1]
 
 
 def build_prompt(profile):
+    
+    supported_rules = build_llm_rule_catalog(
+    "COLUMN"
+)
     return f"""
 You are a senior enterprise data steward responsible for creating reusable,
 machine-executable data quality rules.
@@ -61,6 +69,7 @@ Instructions:
     executable_rule type "none".
 12. Do not invent rule types that are not listed below.
 
+
 Dataset:
 {profile['dataset_name']}
 
@@ -77,40 +86,10 @@ Observed profile:
 - Maximum value: {profile['max_value']}
 - Sample values: {profile['sample_values']}
 
-Supported executable rule types and parameters:
+Supported executable COLUMN rule types:
+{supported_rules}
 
-- none
-  parameters: {{}}
 
-- allowed_values
-  parameters: {{"values": ["value1", "value2"]}}
-
-- not_null
-  parameters: {{}}
-
-- max_length
-  parameters: {{"max_length": 10}}
-
-- min_length
-  parameters: {{"min_length": 1}}
-
-- regex
-  parameters: {{"pattern": "regular expression"}}
-
-- numeric_range
-  parameters: {{"min": 0, "max": 100}}
-
-- percentage_range
-  parameters: {{"min": 0, "max": 100}}
-
-- date_format
-  parameters: {{"format": "MMDDYYYY"}}
-
-- city_ends_with_state_or_zip
-  parameters: {{"city_column": "{profile['column_name']}"}}
-
-- state_field_contains_zip
-  parameters: {{"state_column": "{profile['column_name']}"}}
 
 Return exactly this JSON structure:
 
@@ -232,6 +211,36 @@ def main():
 
             try:
                 rule_json = generate_json(prompt)
+                
+                executable_rule = rule_json.get(
+                    "executable_rule",
+                    {}
+                )
+
+                if executable_rule.get("type") == "none":
+                    print(
+                        f"Skipped {profile['column_name']}: "
+                        "LLM found no defensible rule."
+                    )
+                    continue
+
+                valid, reason, cleaned_rule = (
+                    validate_executable_rule(
+                        executable_rule,
+                        expected_scope="COLUMN",
+                    )
+                )
+
+                if not valid:
+                    print(
+                        f"Skipped {profile['column_name']}: "
+                        f"registry validation failed: {reason}"
+                    )
+                    continue
+
+                rule_json[
+                    "executable_rule"
+                ] = cleaned_rule
 
                 rule_json = apply_rule_guardrails(
                     profile,

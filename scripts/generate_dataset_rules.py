@@ -16,6 +16,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config import engine
 
+from rule_registry import (
+    validate_executable_rule,
+)
 
 # ---------------------------------------------------------------------
 # Command-line argument
