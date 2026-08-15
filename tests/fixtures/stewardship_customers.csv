@@ -1,0 +1,5 @@
+customer_id,city,state,zip,status
+C001,Boston,MA,02108,ACTIVE
+C002,"Miami, FL",,33101,ACTIVE
+C003,Albany 12207,NY,,ACTIVE
+C004,Chicago,IL,60601,INACTIVE

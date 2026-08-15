@@ -1,4 +1,7 @@
+import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import re
 import sys
 import pandas as pd
@@ -31,11 +34,16 @@ from rule_registry import (
     get_rule_types,
     validate_executable_rule,
 )
+from stewardship_context import get_stewardship_run_id
+from scripts.load_dataset import quote_identifier
 # ============================================================
 # Configuration
 # ============================================================
 
-MAX_CANDIDATES = 3
+LOCAL_MAX_CANDIDATES = int(os.getenv("MULTICOLUMN_OLLAMA_MAX_CANDIDATES", "3"))
+API_MAX_CANDIDATES = int(os.getenv("MULTICOLUMN_API_MAX_CANDIDATES", "12"))
+API_MAX_WORKERS = int(os.getenv("MULTICOLUMN_API_MAX_WORKERS", "4"))
+EMPIRICAL_SAMPLE_ROWS = int(os.getenv("MULTICOLUMN_SAMPLE_ROWS", "10000"))
 MIN_CONFIDENCE = 0.75
 MIN_OBSERVED_SUPPORT = 0.95
 MIN_COMPARABLE_ROWS = 25
@@ -57,17 +65,9 @@ MIN_COMPARABLE_ROWS = 25
 # }
 
 
-# ============================================================
-# Command-line argument
-# ============================================================
-
-if len(sys.argv) != 2:
-    print(
-        "Usage: python generate_multicolumn_rules.py <dataset_name>"
-    )
-    sys.exit(1)
-
-DATASET_NAME = sys.argv[1]
+def candidate_limit(provider=LLM_PROVIDER):
+    """Keep local inference bounded while allowing configured APIs more work."""
+    return LOCAL_MAX_CANDIDATES if provider == "ollama" else API_MAX_CANDIDATES
 
 
 # ============================================================
@@ -543,6 +543,155 @@ def analyze_date_relationship(
     }
 
 
+class CandidateAnalysisCache:
+    """Cache normalized column series reused across candidate families."""
+
+    def __init__(self, df):
+        self.df = df
+        self._present = {}
+        self._dates = {}
+
+    def present(self, column):
+        if column not in self._present:
+            values = self.df[column].astype("string").str.strip()
+            self._present[column] = values.notna() & ~values.isin(
+                ["", "None", "nan", "NaN"]
+            )
+        return self._present[column]
+
+    def dates(self, column):
+        if column not in self._dates:
+            self._dates[column] = parse_date_series(self.df[column])
+        return self._dates[column]
+
+
+def _support_evidence(passed, comparable, **details):
+    comparable_rows = int(comparable.sum())
+    if comparable_rows < MIN_COMPARABLE_ROWS:
+        return None
+    passed_rows = int((passed & comparable).sum())
+    return {
+        **details,
+        "comparable_rows": comparable_rows,
+        "passed_rows": passed_rows,
+        "failed_rows": comparable_rows - passed_rows,
+        "support": round(passed_rows / comparable_rows, 4),
+    }
+
+
+def analyze_at_least_one_present(cache, left_column, right_column):
+    left = cache.present(left_column)
+    right = cache.present(right_column)
+    comparable = pd.Series(True, index=left.index)
+    return _support_evidence(
+        left | right,
+        comparable,
+        columns=[left_column, right_column],
+        relationship="at_least_one_present",
+    )
+
+
+def analyze_conditional_completeness(cache, condition_column, required_column):
+    """Find a categorical value that strongly implies required-field presence."""
+    raw_condition = cache.df[condition_column].astype("string").str.strip()
+    required = cache.present(required_column)
+    non_null = raw_condition.notna() & (raw_condition != "")
+    value_counts = raw_condition.loc[non_null].value_counts().head(25)
+    best = None
+    for value, count in value_counts.items():
+        if int(count) < MIN_COMPARABLE_ROWS:
+            continue
+        comparable = non_null & (raw_condition == value)
+        evidence = _support_evidence(
+            required,
+            comparable,
+            condition_column=condition_column,
+            condition_operator="==",
+            condition_value=str(value),
+            required_column=required_column,
+            relationship="conditional_required",
+        )
+        if evidence and (best is None or evidence["support"] > best["support"]):
+            best = evidence
+    return best
+
+
+def analyze_candidate(df, candidate, cache=None):
+    """Run the deterministic support test appropriate for a candidate family."""
+    cache = cache or CandidateAnalysisCache(df)
+    family = candidate["candidate_type"]
+    left = candidate["left_column"]
+    right = candidate["right_column"]
+    if family == "date_relationship":
+        return analyze_date_relationship(df, left, right)
+    if family == "identifier_relationship":
+        return analyze_at_least_one_present(cache, left, right)
+    if family in {
+        "status_date_relationship",
+        "conditional_completeness",
+        "repeated_structure_completeness",
+    }:
+        forward = analyze_conditional_completeness(cache, left, right)
+        if family == "status_date_relationship":
+            return forward
+        reverse = analyze_conditional_completeness(cache, right, left)
+        choices = [item for item in (forward, reverse) if item]
+        return max(choices, key=lambda item: item["support"]) if choices else None
+    if family == "duplicate_semantic_field":
+        comparable = cache.present(left) & cache.present(right)
+        equal = cache.df[left].astype("string").str.strip() == cache.df[right].astype("string").str.strip()
+        return _support_evidence(
+            equal,
+            comparable,
+            columns=[left, right],
+            relationship="columns_equal",
+        )
+    return None
+
+
+def screen_candidates(df, candidates, provider=LLM_PROVIDER):
+    """Empirically screen and rank candidates before spending LLM calls."""
+    cache = CandidateAnalysisCache(df)
+    screened = []
+    diagnostics = {"discovered": len(candidates), "insufficient_data": 0, "low_support": 0}
+    for original in candidates:
+        candidate = dict(original)
+        evidence = analyze_candidate(df, candidate, cache)
+        if evidence is None:
+            diagnostics["insufficient_data"] += 1
+            continue
+        if evidence["support"] < MIN_OBSERVED_SUPPORT:
+            diagnostics["low_support"] += 1
+            continue
+        candidate["empirical_evidence"] = evidence
+        if evidence.get("left_column"):
+            candidate["left_column"] = evidence["left_column"]
+            candidate["right_column"] = evidence["right_column"]
+        candidate["score"] += round(evidence["support"] * 10, 2)
+        screened.append(candidate)
+    screened.sort(key=lambda item: (item["score"], item["empirical_evidence"]["comparable_rows"]), reverse=True)
+    diagnostics["supported"] = len(screened)
+    limit = candidate_limit(provider)
+    diagnostics["selected_for_llm"] = min(len(screened), limit)
+    diagnostics["capacity_skipped"] = max(0, len(screened) - limit)
+    return screened[:limit], diagnostics
+
+
+def review_candidates(dataset, candidates, profile_map, provider=LLM_PROVIDER, generator=generate_json):
+    """Review locally in series or use bounded concurrency for API providers."""
+    def review(candidate):
+        try:
+            return generator(build_candidate_prompt(dataset, candidate, profile_map)), None
+        except LLMError as exc:
+            return None, exc
+
+    workers = 1 if provider == "ollama" else max(1, min(API_MAX_WORKERS, len(candidates)))
+    if workers == 1:
+        return [review(candidate) for candidate in candidates]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(review, candidates))
+
+
 
 def discover_candidates(profiles):
     """
@@ -820,6 +969,63 @@ def discover_candidates(profiles):
             )
 
     # --------------------------------------------------------
+    # CONDITIONAL COMPLETENESS
+    # Categorical type/status fields may make a related detail required.
+    # --------------------------------------------------------
+
+    condition_words = {"type", "status", "category", "class", "kind", "indicator", "flag"}
+    categorical_columns = [
+        column for column in columns
+        if set(tokenize(column)) & condition_words
+        and 1 < int(profile_map[column].get("distinct_count") or 0) <= 25
+    ]
+    for condition_column in categorical_columns:
+        condition_context = set(tokenize(condition_column)) - condition_words
+        for required_column in columns:
+            if required_column == condition_column:
+                continue
+            required_tokens = set(tokenize(required_column))
+            if condition_context and not condition_context.intersection(required_tokens):
+                continue
+            if not condition_context and not set(tokenize(condition_column)).intersection(required_tokens):
+                continue
+            add_candidate(
+                candidates,
+                seen_signatures,
+                candidate_type="conditional_completeness",
+                left_column=condition_column,
+                right_column=required_column,
+                score=78,
+                reason="A categorical field value may conditionally require its related detail field.",
+                allowed_rule_types={"conditional_required"},
+            )
+
+    # --------------------------------------------------------
+    # REPEATED STRUCTURES
+    # owner_1_type/owner_1_name are screened for directional
+    # completeness; repeated slots are never assumed equal.
+    # --------------------------------------------------------
+
+    repeated = {}
+    for column in columns:
+        match = re.match(r"^(.*?)[_](\d+)[_](.+)$", normalize_name(column))
+        if match:
+            repeated.setdefault((match.group(1), match.group(2)), []).append(column)
+    for group_columns in repeated.values():
+        for index, left in enumerate(group_columns):
+            for right in group_columns[index + 1:]:
+                add_candidate(
+                    candidates,
+                    seen_signatures,
+                    candidate_type="repeated_structure_completeness",
+                    left_column=left,
+                    right_column=right,
+                    score=76,
+                    reason="Fields occupy the same repeated entity slot and may have a completeness dependency.",
+                    allowed_rule_types={"conditional_required"},
+                )
+
+    # --------------------------------------------------------
     # True duplicate-semantic fields
     #
     # This is the ONLY candidate family allowed to propose
@@ -907,9 +1113,7 @@ def discover_candidates(profiles):
         reverse=True,
     )
 
-    return candidates[
-        :MAX_CANDIDATES
-    ]
+    return candidates
 
 
 # ============================================================
@@ -1049,9 +1253,10 @@ Allowed executable rule types for THIS candidate:
 
 Your job:
 
-Determine whether the available column names, inferred types, null patterns,
-and sample values provide sufficient evidence for a deterministic,
-reusable business data quality relationship.
+Perform semantic review of the empirically supported relationship. Python has
+already measured support; do not reinterpret the statistics or invent different
+parameters. Decide only whether the observed relationship is a plausible,
+reusable business data quality rule worthy of steward review.
 
 IMPORTANT:
 
@@ -1064,6 +1269,7 @@ IMPORTANT:
 - Do not explain anything outside the JSON object.
 - Do not generate SQL.
 - Only use one of the allowed executable rule types.
+- The executable parameters must exactly reproduce the empirical relationship.
 
 Return exactly:
 
@@ -1543,6 +1749,17 @@ def validate_candidate_response(
                 None,
             )
 
+        empirical = candidate.get("empirical_evidence") or {}
+        expected = {
+            "condition_column": empirical.get("condition_column"),
+            "condition_operator": empirical.get("condition_operator"),
+            "condition_value": empirical.get("condition_value"),
+            "required_column": empirical.get("required_column"),
+        }
+        received = {key: parameters.get(key) for key in expected}
+        if all(value is not None for value in expected.values()) and received != expected:
+            return False, "LLM conditional rule does not match empirical evidence.", None
+
     # ------------------------------------------------------------
     # at_least_one_present
     # ------------------------------------------------------------
@@ -1662,6 +1879,12 @@ def validate_candidate_response(
 
     if empirical_evidence:
 
+        cleaned_rule["model_confidence_score"] = confidence
+        cleaned_rule["confidence_score"] = min(
+            confidence,
+            float(empirical_evidence.get("support", confidence)),
+        )
+
         cleaned_rule[
             "empirical_evidence"
         ] = empirical_evidence
@@ -1697,6 +1920,7 @@ def insert_rule(
                 llm_provider,
                 llm_model,
                 prompt_version
+                ,stewardship_run_id
             )
             VALUES
             (
@@ -1710,6 +1934,7 @@ def insert_rule(
                 :llm_provider,
                 :llm_model,
                 :prompt_version
+                ,:stewardship_run_id
             )
         """),
         {
@@ -1736,6 +1961,9 @@ def insert_rule(
 
             "prompt_version":
                 "multicolumn-pair-v4",
+
+            "stewardship_run_id":
+                get_stewardship_run_id(),
         },
     )
 
@@ -1744,11 +1972,11 @@ def insert_rule(
 # Main
 # ============================================================
 
-def main():
+def main(dataset_name):
 
     print(
         f"Analyzing multi-column relationships "
-        f"for dataset: {DATASET_NAME}"
+        f"for dataset: {dataset_name}"
     )
 
     print(
@@ -1767,14 +1995,14 @@ def main():
 
         dataset = get_dataset(
             conn,
-            DATASET_NAME,
+            dataset_name,
         )
 
         if dataset is None:
 
             raise ValueError(
                 f"Dataset not found or inactive: "
-                f"{DATASET_NAME}"
+                f"{dataset_name}"
             )
 
         dataset = dict(
@@ -1783,20 +2011,20 @@ def main():
 
         profiles = get_column_profiles(
             conn,
-            DATASET_NAME,
+            dataset_name,
         )
 
         if not profiles:
 
             raise ValueError(
                 f"No column profiles exist for "
-                f"{DATASET_NAME}. "
+                f"{dataset_name}. "
                 "Run profiling first."
             )
 
         existing_rules = get_existing_rules(
             conn,
-            DATASET_NAME,
+            dataset_name,
         )
 
     profile_map = {
@@ -1812,11 +2040,22 @@ def main():
 
     raw_table = dataset.get(
         "raw_table",
-        DATASET_NAME
+        dataset_name
     )
 
+    discovered_candidates = discover_candidates(profiles)
+    analysis_columns = sorted({
+        column
+        for candidate in discovered_candidates
+        for column in (candidate["left_column"], candidate["right_column"])
+    })
+    if not analysis_columns:
+        print("No structural multi-column candidates were discovered.")
+        return
+    select_columns = ", ".join(quote_identifier(column) for column in analysis_columns)
     df = pd.read_sql(
-        f'SELECT * FROM "{raw_schema}"."{raw_table}"',
+        f'SELECT {select_columns} FROM {quote_identifier(raw_schema)}.{quote_identifier(raw_table)} '
+        f'LIMIT {EMPIRICAL_SAMPLE_ROWS}',
         engine
     )
 
@@ -1829,8 +2068,10 @@ def main():
     # Discover candidates
     # --------------------------------------------------------
 
-    candidates = discover_candidates(
-        profiles
+    candidates, screening = screen_candidates(
+        df,
+        discovered_candidates,
+        LLM_PROVIDER,
     )
 
     print()
@@ -1840,15 +2081,19 @@ def main():
     )
 
     print(
-        f"Relationship candidates selected: "
-        f"{len(candidates)}"
+        f"Relationship candidates discovered: {screening['discovered']}"
+    )
+    print(
+        f"Candidates with sufficient empirical support: {screening['supported']}"
+    )
+    print(
+        f"Candidates selected for {LLM_PROVIDER}: {screening['selected_for_llm']}"
     )
 
     if not candidates:
 
         print(
-            "No strong multi-column candidates "
-            "were discovered."
+            "No empirically supported multi-column candidates were selected."
         )
 
         return
@@ -1885,14 +2130,21 @@ def main():
     total_duplicates = 0
     total_llm_errors = 0
 
+    reviews = review_candidates(
+        dataset,
+        candidates,
+        profile_map,
+        LLM_PROVIDER,
+    )
+
     # --------------------------------------------------------
     # Analyze each candidate
     # --------------------------------------------------------
 
     with engine.begin() as conn:
 
-        for number, candidate in enumerate(
-            candidates,
+        for number, (candidate, review) in enumerate(
+            zip(candidates, reviews),
             start=1,
         ):
 
@@ -1927,116 +2179,12 @@ def main():
                 f"Reason: "
                 f"{candidate['reason']}"
             )
-###########
-            empirical_evidence = None
-
-            if candidate["candidate_type"] == "date_relationship":
-
-                empirical_evidence = analyze_date_relationship(
-                    df,
-                    candidate["left_column"],
-                    candidate["right_column"],
-                )
-
-                if empirical_evidence is None:
-
-                    print(
-                        "Candidate skipped: "
-                        "not enough comparable date records."
-                    )
-
-                    continue
-
-                print(
-                    "Observed relationship:"
-                )
-
-                print(
-                    f"  {empirical_evidence['left_column']} "
-                    f"{empirical_evidence['operator']} "
-                    f"{empirical_evidence['right_column']}"
-                )
-
-                print(
-                    f"  Comparable rows: "
-                    f"{empirical_evidence['comparable_rows']}"
-                )
-
-                print(
-                    f"  Passed rows: "
-                    f"{empirical_evidence['passed_rows']}"
-                )
-
-                print(
-                    f"  Failed rows: "
-                    f"{empirical_evidence['failed_rows']}"
-                )
-
-                print(
-                    f"  Observed support: "
-                    f"{empirical_evidence['support']:.2%}"
-                )
-
-                if (
-                    empirical_evidence["support"]
-                    < MIN_OBSERVED_SUPPORT
-                ):
-
-                    print(
-                        "Candidate skipped: "
-                        f"observed support below "
-                        f"{MIN_OBSERVED_SUPPORT:.0%}."
-                    )
-
-                    continue
-
-                # Replace the original pair ordering with the
-                # empirically supported ordering.
-                candidate = dict(
-                    candidate
-                )
-
-                candidate[
-                    "left_column"
-                ] = empirical_evidence[
-                    "left_column"
-                ]
-
-                candidate[
-                    "right_column"
-                ] = empirical_evidence[
-                    "right_column"
-                ]
-
-                candidate[
-                    "empirical_evidence"
-                ] = empirical_evidence
-
-
-            prompt = build_candidate_prompt(
-                dataset,
-                candidate,
-                profile_map,
-            )
-
-            # ------------------------------------------------
-            # LLM call
-            # ------------------------------------------------
-
-            try:
-
-                response = generate_json(
-                    prompt
-                )
-
-            except LLMError as exc:
-
+            response, llm_error = review
+            if llm_error is not None:
                 total_llm_errors += 1
-
                 print(
-                    f"LLM error: {exc}"
+                    f"LLM error: {llm_error}"
                 )
-
                 continue
 
             # ------------------------------------------------
@@ -2093,7 +2241,7 @@ def main():
 
             insert_rule(
                 conn,
-                DATASET_NAME,
+                dataset_name,
                 rule,
             )
 
@@ -2145,8 +2293,19 @@ def main():
     )
 
     print(
-        f"Candidates sent to LLM: "
-        f"{len(candidates)}"
+        f"Candidates discovered: {screening['discovered']}"
+    )
+    print(
+        f"Insufficient-data candidates: {screening['insufficient_data']}"
+    )
+    print(
+        f"Low-support candidates: {screening['low_support']}"
+    )
+    print(
+        f"Capacity-limited candidates: {screening['capacity_skipped']}"
+    )
+    print(
+        f"Candidates sent to LLM: {screening['selected_for_llm']}"
     )
 
     print(
@@ -2176,4 +2335,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dataset_name")
+    main(parser.parse_args().dataset_name)

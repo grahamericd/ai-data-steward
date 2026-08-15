@@ -10,13 +10,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
     
-from config import RAW_DATA_DIR, engine
+from config import LLM_MODEL, LLM_PROVIDER, RAW_DATA_DIR, engine
 from llm_client import LLMError, generate_json
 
 from rule_registry import (
     build_llm_rule_catalog,
     validate_executable_rule,
 )
+from stewardship_context import get_stewardship_run_id
 
 if len(sys.argv) != 2:
     print("Usage: python generate_rules.py <dataset_name>")
@@ -272,7 +273,12 @@ def main():
                         column_name,
                         rule_type,
                         rule_definition,
-                        status
+                        status,
+                        generated_by,
+                        llm_provider,
+                        llm_model,
+                        prompt_version
+                        ,stewardship_run_id
                     )
                     VALUES
                     (
@@ -280,14 +286,22 @@ def main():
                         :column_name,
                         'llm_generated',
                         CAST(:rule_definition AS jsonb),
-                        :status
+                        :status,
+                        'llm',
+                        :llm_provider,
+                        :llm_model,
+                        'column-rule-v1'
+                        ,:stewardship_run_id
                     )
                 """),
                 {
                     "dataset_name": profile["dataset_name"],
                     "column_name": profile["column_name"],
                     "rule_definition": json.dumps(rule_json),
-                    "status": "guardrail_rejected" if rule_json.get("guardrail_applied") else "proposed"
+                    "status": "guardrail_rejected" if rule_json.get("guardrail_applied") else "proposed",
+                    "llm_provider": LLM_PROVIDER,
+                    "llm_model": LLM_MODEL,
+                    "stewardship_run_id": get_stewardship_run_id(),
                 }
             )
 
