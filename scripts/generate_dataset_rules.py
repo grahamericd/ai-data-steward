@@ -19,6 +19,7 @@ from config import engine
 from rule_registry import (
     validate_executable_rule,
 )
+from stewardship_context import get_stewardship_run_id
 
 # ---------------------------------------------------------------------
 # Command-line argument
@@ -140,6 +141,7 @@ def insert_rule(
                 llm_provider,
                 llm_model,
                 prompt_version
+                ,stewardship_run_id
             )
             VALUES
             (
@@ -153,6 +155,7 @@ def insert_rule(
                 NULL,
                 NULL,
                 'dataset-rule-v1'
+                ,:stewardship_run_id
             )
         """),
         {
@@ -165,6 +168,7 @@ def insert_rule(
             "target_columns": json.dumps(
                 target_columns
             ),
+            "stewardship_run_id": get_stewardship_run_id(),
         },
     )
 

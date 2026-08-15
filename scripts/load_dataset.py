@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import RAW_DATA_DIR, engine
+from stewardship_context import get_stewardship_actor, get_stewardship_run_id
 
 
 # ---------------------------------------------------------------------
@@ -773,6 +774,7 @@ def create_load_run(dataset, source_file, load_mode, initiated_by=None):
                         primary_key_name,
                         status,
                         initiated_by
+                        ,stewardship_run_id
                     )
                     VALUES
                     (
@@ -786,6 +788,7 @@ def create_load_run(dataset, source_file, load_mode, initiated_by=None):
                         :primary_key_name,
                         'running',
                         :initiated_by
+                        ,:stewardship_run_id
                     )
                     RETURNING load_run_id
                 """),
@@ -798,7 +801,8 @@ def create_load_run(dataset, source_file, load_mode, initiated_by=None):
                     "target_schema": dataset.get("raw_schema"),
                     "target_table": dataset.get("raw_table"),
                     "primary_key_name": dataset.get("primary_key"),
-                    "initiated_by": initiated_by,
+                    "initiated_by": initiated_by or get_stewardship_actor(),
+                    "stewardship_run_id": get_stewardship_run_id(),
                 },
             ).scalar_one()
         )

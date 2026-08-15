@@ -216,6 +216,21 @@ RULE_REGISTRY = {
         },
     ),
 
+    "reference_value": RuleSpec(
+        rule_type="reference_value",
+        scope="COLUMN",
+        executor="evaluate_reference_value",
+        description="Value must exist in a registered authoritative reference dataset.",
+        required_parameters=("reference_dataset", "reference_column"),
+        optional_parameters=("case_sensitive",),
+        parameter_types={
+            "reference_dataset": str,
+            "reference_column": str,
+            "case_sensitive": bool,
+        },
+        llm_generatable=False,
+    ),
+
     # ========================================================
     # ROW / MULTI-COLUMN RULES
     # ========================================================
@@ -309,6 +324,45 @@ RULE_REGISTRY = {
         },
     ),
 
+    "reference_combination": RuleSpec(
+        rule_type="reference_combination",
+        scope="ROW",
+        executor="evaluate_reference_combination",
+        description=(
+            "Column values must form a valid combination in a registered "
+            "authoritative reference dataset."
+        ),
+        required_parameters=("reference_dataset", "column_mapping"),
+        optional_parameters=("case_sensitive", "ignore_nulls"),
+        parameter_types={
+            "reference_dataset": str,
+            "column_mapping": dict,
+            "case_sensitive": bool,
+            "ignore_nulls": bool,
+        },
+        llm_generatable=False,
+    ),
+
+    "city_state_zip_reference": RuleSpec(
+        rule_type="city_state_zip_reference",
+        scope="ROW",
+        executor="evaluate_city_state_zip_reference",
+        description=(
+            "City, state, and ZIP must be an authoritative registered combination."
+        ),
+        required_parameters=("city_column", "state_column", "zip_column"),
+        optional_parameters=("reference_dataset", "case_sensitive", "ignore_nulls"),
+        parameter_types={
+            "city_column": str,
+            "state_column": str,
+            "zip_column": str,
+            "reference_dataset": str,
+            "case_sensitive": bool,
+            "ignore_nulls": bool,
+        },
+        llm_generatable=False,
+    ),
+
     # ========================================================
     # DATASET RULES
     # ========================================================
@@ -377,6 +431,51 @@ RULE_ALIASES = {
     "pattern":
         "regex",
 }
+
+
+def normalize_executable_rule(
+    executable_rule: dict,
+) -> dict:
+    """Return the one supported executable-rule JSON shape.
+
+    Older persisted rules sometimes placed parameters beside ``type``.
+    Accept that shape at the boundary, then immediately normalize it so
+    generation, approval, and execution all use ``parameters``.
+    """
+
+    if not isinstance(executable_rule, dict):
+        return executable_rule
+
+    if "parameters" in executable_rule:
+        return executable_rule
+
+    return {
+        "type": executable_rule.get("type"),
+        "parameters": {
+            key: value
+            for key, value in executable_rule.items()
+            if key != "type"
+        },
+    }
+
+
+def extract_executable_rule(rule_definition: dict | str) -> dict:
+    """Extract and normalize ``executable_rule`` from a rule definition."""
+
+    if isinstance(rule_definition, str):
+        import json
+        rule_definition = json.loads(rule_definition)
+
+    if not isinstance(rule_definition, dict):
+        raise ValueError("rule_definition must be a JSON object.")
+
+    executable_rule = rule_definition.get("executable_rule")
+    if executable_rule is None:
+        raise ValueError(
+            "rule_definition does not contain executable_rule."
+        )
+
+    return normalize_executable_rule(executable_rule)
 
 
 # ============================================================
@@ -466,6 +565,8 @@ def validate_executable_rule(
         (False, reason, None)
     """
 
+    executable_rule = normalize_executable_rule(executable_rule)
+
     if not isinstance(
         executable_rule,
         dict,
@@ -499,6 +600,13 @@ def validate_executable_rule(
         return (
             False,
             f"Unsupported rule type: {rule_type}",
+            None,
+        )
+
+    if not spec.executor:
+        return (
+            False,
+            f"Rule '{canonical_type}' does not have an executor.",
             None,
         )
 
@@ -655,6 +763,43 @@ def validate_executable_rule(
                 None,
             )
 
+    # Structural and value constraints that cannot be expressed by Python
+    # type checks alone.
+    if canonical_type in {"numeric_range", "percentage_range"}:
+        if parameters["min"] > parameters["max"]:
+            return False, "Range min must be less than or equal to max.", None
+
+    if canonical_type == "column_comparison":
+        if parameters.get("null_behavior", "ignore") not in {"ignore", "fail"}:
+            return False, "null_behavior must be 'ignore' or 'fail'.", None
+
+    if canonical_type in {
+        "at_least_one_present",
+        "columns_equal",
+        "column_combination_unique",
+    }:
+        columns = parameters["columns"]
+        minimum = 2
+        if len(columns) < minimum or not all(
+            isinstance(column, str) and column.strip() for column in columns
+        ):
+            return False, f"Rule '{canonical_type}' requires at least two column names.", None
+
+    if canonical_type == "reference_combination":
+        mapping = parameters["column_mapping"]
+        if not mapping or not all(
+            isinstance(source, str)
+            and source.strip()
+            and isinstance(reference, str)
+            and reference.strip()
+            for source, reference in mapping.items()
+        ):
+            return False, "column_mapping must map source column names to reference keys.", None
+
+    for positive_parameter in ("max_length", "min_length", "minimum_rows"):
+        if positive_parameter in parameters and parameters[positive_parameter] < 0:
+            return False, f"Parameter '{positive_parameter}' cannot be negative.", None
+
     cleaned = {
         "type": canonical_type,
         "parameters": parameters,
@@ -731,3 +876,30 @@ def build_llm_rule_catalog(
     return "\n\n".join(
         sections
     )
+
+
+def validate_rule_for_approval(
+    rule_definition: dict | str,
+    rule_scope: str,
+) -> tuple[bool, str | None, dict | None]:
+    """Validate and canonicalize a persisted rule before approval."""
+
+    try:
+        if isinstance(rule_definition, str):
+            import json
+            rule_definition = json.loads(rule_definition)
+
+        executable_rule = extract_executable_rule(rule_definition)
+    except (TypeError, ValueError) as exc:
+        return False, str(exc), None
+
+    valid, reason, cleaned = validate_executable_rule(
+        executable_rule,
+        expected_scope=rule_scope or "COLUMN",
+    )
+    if not valid:
+        return False, reason, None
+
+    normalized_definition = dict(rule_definition)
+    normalized_definition["executable_rule"] = cleaned
+    return True, None, normalized_definition

@@ -4,6 +4,8 @@ AI Data Steward is an **AI-assisted data stewardship platform** that combines me
 
 Unlike traditional data quality tools that begin after data has been loaded, AI Data Steward manages the complete stewardship lifecycle—from dataset registration through curated data creation—with full load history and row-level lineage.
 
+For installation, operating procedures, screen-by-screen guidance, governance practices, and troubleshooting, see the [AI Steward User Manual](docs/USER_MANUAL.md).
+
 ---
 
 ## Key Features

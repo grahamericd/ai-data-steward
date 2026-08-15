@@ -19,9 +19,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import engine
 
 from rule_registry import (
+    extract_executable_rule,
     get_rule_spec,
     validate_executable_rule,
 )
+from stewardship_context import get_stewardship_run_id
 
 
 # ============================================================
@@ -110,6 +112,14 @@ def parse_date_series(series):
     return result
 
 
+class FailureSamples(list):
+    """Display samples carrying the complete identifier set internally."""
+
+    def __init__(self, records, row_identifiers):
+        super().__init__(records)
+        self.row_identifiers = row_identifiers
+
+
 def sample_failure_records(
     df,
     failed_mask,
@@ -124,6 +134,25 @@ def sample_failure_records(
     failed_rows = df.loc[
         failed_mask
     ]
+
+    if primary_key and primary_key in failed_rows.columns:
+        identifier_values = failed_rows[primary_key]
+    elif "_dq_row_identifier" in failed_rows.columns:
+        identifier_values = failed_rows["_dq_row_identifier"]
+    else:
+        identifier_values = pd.Series(
+            [f"index:{index}" for index in failed_rows.index],
+            index=failed_rows.index,
+        )
+
+    row_identifiers = []
+    for index, value in identifier_values.items():
+        if pd.notna(value):
+            row_identifiers.append(str(value))
+        elif "_dq_row_identifier" in failed_rows.columns:
+            row_identifiers.append(str(failed_rows.at[index, "_dq_row_identifier"]))
+        else:
+            row_identifiers.append(f"index:{index}")
 
     selected_columns = []
 
@@ -151,7 +180,7 @@ def sample_failure_records(
             selected_columns
         ]
 
-    return (
+    records = (
         failed_rows
         .head(limit)
         .where(
@@ -164,6 +193,8 @@ def sample_failure_records(
             orient="records"
         )
     )
+
+    return FailureSamples(records, row_identifiers)
 
 
 # ============================================================
@@ -690,6 +721,200 @@ def evaluate_state_field_contains_zip(
                 primary_key=primary_key,
             ),
     }
+
+
+def _quote_reference_identifier(value):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(value or "")):
+        raise ValueError(f"Invalid reference identifier: {value!r}")
+    return f'"{value}"'
+
+
+def find_matching_reference_keys(
+    reference_dataset,
+    reference_columns,
+    source_keys,
+    case_sensitive=False,
+):
+    """Return only source keys present in a registered reference dataset."""
+
+    if not source_keys:
+        return set()
+
+    with engine.begin() as conn:
+        registration = conn.execute(
+            text("""
+                SELECT schema_name, table_name, key_columns
+                FROM metadata.reference_dataset
+                WHERE reference_dataset_name = :name AND active = TRUE
+            """),
+            {"name": reference_dataset},
+        ).mappings().first()
+        if registration is None:
+            raise ValueError(
+                f"Reference dataset is not registered or active: {reference_dataset}"
+            )
+
+        allowed_columns = registration["key_columns"]
+        if isinstance(allowed_columns, str):
+            allowed_columns = json.loads(allowed_columns)
+        if not set(reference_columns).issubset(set(allowed_columns or [])):
+            raise ValueError(
+                f"Reference columns {reference_columns} are not registered keys "
+                f"for {reference_dataset}."
+            )
+
+        schema = _quote_reference_identifier(registration["schema_name"])
+        table_name = _quote_reference_identifier(registration["table_name"])
+        aliases = [f"v{index}" for index in range(len(reference_columns))]
+        record_columns = ", ".join(f'"{alias}" text' for alias in aliases)
+        comparisons = []
+        for alias, reference_column in zip(aliases, reference_columns):
+            left = f'r.{_quote_reference_identifier(reference_column)}::text'
+            right = f'x."{alias}"'
+            comparisons.append(
+                f"{left} = {right}"
+                if case_sensitive
+                else f"LOWER({left}) = LOWER({right})"
+            )
+        select_values = ", ".join(f'x."{alias}"' for alias in aliases)
+        payload = [
+            {alias: value for alias, value in zip(aliases, key)}
+            for key in source_keys
+        ]
+        rows = conn.execute(
+            text(f"""
+                WITH incoming AS
+                (
+                    SELECT *
+                    FROM jsonb_to_recordset(CAST(:payload AS jsonb))
+                    AS x({record_columns})
+                )
+                SELECT DISTINCT {select_values}
+                FROM incoming x
+                INNER JOIN {schema}.{table_name} r
+                    ON {' AND '.join(comparisons)}
+            """),
+            {"payload": json.dumps(payload)},
+        ).all()
+
+    return {tuple(str(value) for value in row) for row in rows}
+
+
+def evaluate_reference_combination(
+    df,
+    *,
+    reference_dataset,
+    column_mapping,
+    case_sensitive=False,
+    ignore_nulls=True,
+    primary_key=None,
+    **kwargs,
+):
+    """Validate source column combinations against authoritative reference keys."""
+
+    if not column_mapping:
+        raise ValueError("column_mapping must not be empty.")
+    source_columns = list(column_mapping)
+    reference_columns = [column_mapping[column] for column in source_columns]
+    for column in source_columns:
+        if column not in df.columns:
+            raise ValueError(f"Column not found: {column}")
+
+    normalized = pd.DataFrame(index=df.index)
+    for column in source_columns:
+        normalized[column] = normalize_blank_series(df[column])
+    populated_mask = normalized.notna().all(axis=1) & normalized.ne("").all(axis=1)
+
+    source_keys = list(
+        dict.fromkeys(
+            tuple(str(value) for value in row)
+            for row in normalized.loc[populated_mask, source_columns].itertuples(
+                index=False, name=None
+            )
+        )
+    )
+    matches = find_matching_reference_keys(
+        reference_dataset,
+        reference_columns,
+        source_keys,
+        case_sensitive=case_sensitive,
+    )
+    if not case_sensitive:
+        matches = {tuple(value.lower() for value in key) for key in matches}
+
+    def row_matches(row):
+        key = tuple(str(value) for value in row)
+        if not case_sensitive:
+            key = tuple(value.lower() for value in key)
+        return key in matches
+
+    matched_mask = pd.Series(False, index=df.index)
+    matched_mask.loc[populated_mask] = [
+        row_matches(row)
+        for row in normalized.loc[populated_mask, source_columns].itertuples(
+            index=False, name=None
+        )
+    ]
+    failed_mask = populated_mask & ~matched_mask
+    if not ignore_nulls:
+        failed_mask = failed_mask | ~populated_mask
+
+    return {
+        "failed_count": int(failed_mask.sum()),
+        "reference_dataset": reference_dataset,
+        "sample_failures": sample_failure_records(
+            df,
+            failed_mask,
+            columns=source_columns,
+            primary_key=primary_key,
+        ),
+    }
+
+
+def evaluate_reference_value(
+    df,
+    column_name,
+    *,
+    reference_dataset,
+    reference_column,
+    case_sensitive=False,
+    primary_key=None,
+    **kwargs,
+):
+    return evaluate_reference_combination(
+        df,
+        reference_dataset=reference_dataset,
+        column_mapping={column_name: reference_column},
+        case_sensitive=case_sensitive,
+        ignore_nulls=True,
+        primary_key=primary_key,
+    )
+
+
+def evaluate_city_state_zip_reference(
+    df,
+    *,
+    city_column,
+    state_column,
+    zip_column,
+    reference_dataset="us_zip_codes",
+    case_sensitive=False,
+    ignore_nulls=True,
+    primary_key=None,
+    **kwargs,
+):
+    return evaluate_reference_combination(
+        df,
+        reference_dataset=reference_dataset,
+        column_mapping={
+            city_column: "place_name",
+            state_column: "state_code",
+            zip_column: "zip_code",
+        },
+        case_sensitive=case_sensitive,
+        ignore_nulls=ignore_nulls,
+        primary_key=primary_key,
+    )
 
 
 # ============================================================
@@ -1269,6 +1494,9 @@ EXECUTOR_FUNCTIONS = {
     "evaluate_state_field_contains_zip":
         evaluate_state_field_contains_zip,
 
+    "evaluate_reference_value":
+        evaluate_reference_value,
+
     "evaluate_column_comparison":
         evaluate_column_comparison,
 
@@ -1280,6 +1508,12 @@ EXECUTOR_FUNCTIONS = {
 
     "evaluate_columns_equal":
         evaluate_columns_equal,
+
+    "evaluate_reference_combination":
+        evaluate_reference_combination,
+
+    "evaluate_city_state_zip_reference":
+        evaluate_city_state_zip_reference,
 
     "evaluate_minimum_row_count":
         evaluate_minimum_row_count,
@@ -1295,96 +1529,6 @@ EXECUTOR_FUNCTIONS = {
 # ============================================================
 # Rule-definition compatibility
 # ============================================================
-
-def extract_executable_rule(
-    rule_definition,
-):
-    """
-    Extract executable_rule from current rule JSON.
-
-    Also provides limited compatibility with older rules that
-    stored parameters alongside type rather than under parameters.
-    """
-
-    if isinstance(
-        rule_definition,
-        str,
-    ):
-
-        rule_definition = json.loads(
-            rule_definition
-        )
-
-    if not isinstance(
-        rule_definition,
-        dict,
-    ):
-
-        raise ValueError(
-            "rule_definition must be a JSON object."
-        )
-
-    executable_rule = (
-        rule_definition.get(
-            "executable_rule"
-        )
-    )
-
-    if executable_rule is None:
-
-        raise ValueError(
-            "rule_definition does not contain executable_rule."
-        )
-
-    if not isinstance(
-        executable_rule,
-        dict,
-    ):
-
-        raise ValueError(
-            "executable_rule must be a JSON object."
-        )
-
-    # --------------------------------------------------------
-    # Legacy compatibility
-    #
-    # Older rules occasionally looked like:
-    #
-    # {
-    #     "type": "percentage_range",
-    #     "min": 0,
-    #     "max": 100
-    # }
-    #
-    # Convert that to the canonical contract.
-    # --------------------------------------------------------
-
-    if (
-        "parameters"
-        not in executable_rule
-    ):
-
-        rule_type = executable_rule.get(
-            "type"
-        )
-
-        parameters = {
-            key: value
-            for key, value
-            in executable_rule.items()
-            if key != "type"
-        }
-
-        executable_rule = {
-            "type":
-                rule_type,
-
-            "parameters":
-                parameters,
-        }
-
-    return executable_rule
-
 
 # ============================================================
 # Result persistence
@@ -1403,8 +1547,14 @@ def write_result(
     results written for earlier rules.
     """
 
+    stored_details = dict(result_details)
+    row_identifiers = stored_details.pop(
+        "_failed_row_identifiers",
+        [],
+    )
+
     failed_count = int(
-        result_details.get(
+        stored_details.get(
             "failed_count",
             0,
         )
@@ -1412,7 +1562,7 @@ def write_result(
 
     with engine.begin() as conn:
 
-        conn.execute(
+        result_id = conn.execute(
             text("""
                 INSERT INTO dq.result
                 (
@@ -1421,6 +1571,7 @@ def write_result(
                     result_status,
                     failed_count,
                     details
+                    ,stewardship_run_id
                 )
                 VALUES
                 (
@@ -1432,7 +1583,9 @@ def write_result(
                         :details
                         AS jsonb
                     )
+                    ,:stewardship_run_id
                 )
+                RETURNING id
             """),
             {
                 "dataset_name":
@@ -1449,11 +1602,122 @@ def write_result(
 
                 "details":
                     json.dumps(
-                        result_details,
+                        stored_details,
                         default=str,
                     ),
+                "stewardship_run_id": get_stewardship_run_id(),
             },
+        ).scalar_one()
+
+        if row_identifiers:
+            conn.execute(
+                text("""
+                    INSERT INTO dq.failed_record
+                    (
+                        result_id,
+                        rule_id,
+                        dataset_name,
+                        source_row_identifier
+                    )
+                    VALUES
+                    (
+                        :result_id,
+                        :rule_id,
+                        :dataset_name,
+                        :source_row_identifier
+                    )
+                """),
+                [
+                    {
+                        "result_id": result_id,
+                        "rule_id": rule_id,
+                        "dataset_name": dataset_name,
+                        "source_row_identifier": identifier,
+                    }
+                    for identifier in row_identifiers
+                ],
+            )
+
+    return result_id
+
+
+def evaluate_rule(rule, df, primary_key=None):
+    """Evaluate one rule without allowing its failure to escape the boundary."""
+
+    rule_scope = rule.get("rule_scope") or "COLUMN"
+    column_name = rule.get("column_name")
+    rule_type = rule.get("rule_type")
+
+    try:
+        executable_rule = extract_executable_rule(rule.get("rule_definition"))
+        valid, reason, executable_rule = validate_executable_rule(
+            executable_rule,
+            expected_scope=rule_scope,
         )
+        if not valid:
+            raise ValueError(f"Registry validation failed: {reason}")
+
+        rule_type = executable_rule["type"]
+        parameters = executable_rule["parameters"]
+        spec = get_rule_spec(rule_type)
+
+        if spec is None or not spec.executor:
+            raise ValueError(f"Rule '{rule_type}' has no registered executor.")
+
+        executor = EXECUTOR_FUNCTIONS.get(spec.executor)
+        if executor is None:
+            raise ValueError(
+                f"Registered executor '{spec.executor}' is not implemented."
+            )
+
+        if rule_scope == "COLUMN":
+            if not column_name:
+                raise ValueError("COLUMN rule does not have a column_name.")
+            details = executor(
+                df,
+                column_name,
+                primary_key=primary_key,
+                **parameters,
+            )
+        else:
+            details = executor(
+                df,
+                primary_key=primary_key,
+                **parameters,
+            )
+
+        if not isinstance(details, dict):
+            raise TypeError("Rule executor must return a details JSON object.")
+        if "failed_count" not in details:
+            raise ValueError("Rule executor result is missing failed_count.")
+
+        failed_count = details["failed_count"]
+        if (
+            isinstance(failed_count, bool)
+            or not isinstance(failed_count, int)
+            or failed_count < 0
+        ):
+            raise ValueError(
+                "Rule executor failed_count must be a non-negative integer."
+            )
+
+        samples = details.get("sample_failures")
+        if isinstance(samples, FailureSamples):
+            details["sample_failures"] = list(samples)
+            details["_failed_row_identifiers"] = samples.row_identifiers
+
+        return ("PASS" if failed_count == 0 else "FAIL"), details
+
+    except Exception as exc:
+        return "ERROR", {
+            "failed_count": 0,
+            "evaluation_failed": True,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "rule_type": rule_type,
+            "rule_scope": rule_scope,
+            "column_name": column_name,
+        }
 
 
 # ============================================================
@@ -1557,7 +1821,7 @@ def main(dataset_name):
 
     df = pd.read_sql(
         (
-            f'SELECT * '
+            f'SELECT *, ctid::text AS "_dq_row_identifier" '
             f'FROM "{raw_schema}"."{raw_table}"'
         ),
         engine,
@@ -1621,191 +1885,37 @@ def main(dataset_name):
                 f"Column: {column_name}"
             )
 
-        try:
+        result_status, result_details = evaluate_rule(
+            rule,
+            df,
+            primary_key=primary_key,
+        )
 
-            # ------------------------------------------------
-            # Extract canonical executable rule
-            # ------------------------------------------------
-
-            executable_rule = (
-                extract_executable_rule(
-                    rule_definition
-                )
-            )
-
-            # ------------------------------------------------
-            # Registry validation
-            # ------------------------------------------------
-
-            valid, reason, executable_rule = (
-                validate_executable_rule(
-                    executable_rule,
-                    expected_scope=
-                        rule_scope,
-                )
-            )
-
-            if not valid:
-
-                raise ValueError(
-                    "Registry validation failed: "
-                    f"{reason}"
-                )
-
-            rule_type = executable_rule[
-                "type"
-            ]
-
-            parameters = executable_rule[
-                "parameters"
-            ]
-
-            print(
-                f"Rule type: {rule_type}"
-            )
-
-            # ------------------------------------------------
-            # Get specification from central registry
-            # ------------------------------------------------
-
-            spec = get_rule_spec(
-                rule_type
-            )
-
-            if spec is None:
-
-                raise ValueError(
-                    f"No registry specification "
-                    f"found for rule: "
-                    f"{rule_type}"
-                )
-
-            if not spec.executor:
-
-                raise ValueError(
-                    f"Rule '{rule_type}' has "
-                    "no registered executor."
-                )
-
-            # ------------------------------------------------
-            # Resolve actual executor function
-            # ------------------------------------------------
-
-            executor = (
-                EXECUTOR_FUNCTIONS.get(
-                    spec.executor
-                )
-            )
-
-            if executor is None:
-
-                raise ValueError(
-                    f"Registered executor "
-                    f"'{spec.executor}' "
-                    "is not implemented in "
-                    "evaluate_rules.py."
-                )
-
-            # ------------------------------------------------
-            # Execute
-            # ------------------------------------------------
-
-            if rule_scope == "COLUMN":
-
-                if not column_name:
-
-                    raise ValueError(
-                        "COLUMN rule does not have "
-                        "a column_name."
-                    )
-
-                result_details = executor(
-                    df,
-                    column_name,
-                    primary_key=
-                        primary_key,
-                    **parameters,
-                )
-
-            else:
-
-                result_details = executor(
-                    df,
-                    primary_key=
-                        primary_key,
-                    **parameters,
-                )
-
-            # ------------------------------------------------
-            # Determine result
-            # ------------------------------------------------
-
-            failed_count = int(
-                result_details.get(
-                    "failed_count",
-                    0,
-                )
-            )
-
-            result_status = (
-                "PASS"
-                if failed_count == 0
-                else "FAIL"
-            )
-
-            if result_status == "PASS":
-
-                pass_count += 1
-
-            else:
-
-                fail_count += 1
-
-        # ====================================================
-        # Rule-level error isolation
-        # ====================================================
-
-        except Exception as exc:
-
-            result_status = (
-                "ERROR"
-            )
-
+        if result_status == "PASS":
+            pass_count += 1
+        elif result_status == "FAIL":
+            fail_count += 1
+        else:
             error_count += 1
-
-            result_details = {
-                "failed_count": 0,
-
-                "error_type":
-                    type(exc).__name__,
-
-                "message":
-                    str(exc),
-
-                "rule_scope":
-                    rule_scope,
-
-                "column_name":
-                    column_name,
-            }
 
         # ====================================================
         # Persist result
         # ====================================================
 
-        write_result(
-            dataset_name=
-                dataset_name,
-
-            rule_id=
-                rule_id,
-
-            result_status=
-                result_status,
-
-            result_details=
-                result_details,
-        )
+        try:
+            write_result(
+                dataset_name=dataset_name,
+                rule_id=rule_id,
+                result_status=result_status,
+                result_details=result_details,
+            )
+        except Exception as persistence_error:
+            # Each write owns its transaction. A persistence failure for one
+            # result cannot roll back prior results or stop later rules.
+            print(
+                f"Could not persist Rule {rule_id} result: "
+                f"{type(persistence_error).__name__}: {persistence_error}"
+            )
 
         print(
             f"Result: {result_status}"

@@ -21,15 +21,72 @@ from scripts.load_dataset import (
     load_dataset,
     get_parser_definition,
     parse_fixed_width_record,
+    quote_identifier,
+)
+from rule_approval import approve_rule, change_rule_status
+from remediation_decision import change_remediation_status
+
+st.set_page_config(
+    page_title="AI Steward | Data Quality",
+    page_icon="◆",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.set_page_config(page_title="Data Quality Lab", layout="wide")
+theme_path = PROJECT_ROOT / "assets" / "streamlit_theme.css"
+st.markdown(
+    f"<style>{theme_path.read_text(encoding='utf-8')}</style>",
+    unsafe_allow_html=True,
+)
 
-st.title("AI-Assisted Data Quality Lab")
+st.sidebar.markdown(
+    """
+    <div class="steward-brand">
+      <div class="steward-brand-mark">AI</div>
+      <div>
+        <div class="steward-brand-name">AI Steward</div>
+        <div class="steward-brand-subtitle">Data quality service</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 page = st.sidebar.radio(
-    "Navigation",
+    "Workspace",
     ["Dashboard", "Register Dataset", "Incremental Data Load","Dataset 360", "Steward Workbench", "Rule Catalog", "Failed Records", "Remediation Queue", "Raw Data Preview", "Run Pipeline"]
+)
+
+steward_identity = st.sidebar.text_input(
+    "Steward identity",
+    help="Required for approvals, rejections, and other governance decisions.",
+).strip()
+decision_note = st.sidebar.text_area(
+    "Decision note (optional)",
+)
+
+page_descriptions = {
+    "Dashboard": "A statewide view of data health, rule performance, and work requiring attention.",
+    "Register Dataset": "Bring a governed source into the stewardship workflow.",
+    "Incremental Data Load": "Validate and load new source records with traceable run history.",
+    "Dataset 360": "Explore one dataset across metadata, quality, lineage, and remediation.",
+    "Steward Workbench": "Review proposed rules and make accountable governance decisions.",
+    "Rule Catalog": "Inspect rule contracts, provenance, status, and decision history.",
+    "Failed Records": "Trace quality failures from evaluated rules to individual source rows.",
+    "Remediation Queue": "Review safe corrections and their originating quality failures.",
+    "Raw Data Preview": "Inspect a controlled sample of registered source data.",
+    "Run Pipeline": "Coordinate profiling, rule generation, evaluation, and remediation.",
+}
+
+st.markdown(
+    f"""
+    <section class="steward-masthead">
+      <div class="steward-eyebrow">Trusted data stewardship</div>
+      <h1>{page}</h1>
+      <p>{page_descriptions[page]}</p>
+    </section>
+    """,
+    unsafe_allow_html=True,
 )
 
 def read_sql(query, params=None):
@@ -245,6 +302,7 @@ if page == "Dashboard":
             COUNT(*) AS rule_runs,
             SUM(CASE WHEN r.result_status = 'PASS' THEN 1 ELSE 0 END) AS passed,
             SUM(CASE WHEN r.result_status = 'FAIL' THEN 1 ELSE 0 END) AS failed,
+            SUM(CASE WHEN r.result_status = 'ERROR' THEN 1 ELSE 0 END) AS errors,
             SUM(r.failed_count) AS failed_records
         FROM dq.result r
         GROUP BY r.dataset_name
@@ -501,7 +559,7 @@ elif page == "Incremental Data Load":
                     ),
                     requested_mode=load_mode,
                     source_file_label=uploaded_file.name,
-                    initiated_by="streamlit_user",
+                    initiated_by=steward_identity or None,
                 )
 
             st.success(
@@ -764,7 +822,12 @@ elif page == "Steward Workbench":
             rule_type,
             status,
             rule_definition,
-            created_at
+            created_at,
+            llm_provider,
+            llm_model,
+            prompt_version,
+            decision_by,
+            decision_at
         FROM dq.rule
         WHERE status IN ('proposed', 'guardrail_rejected')
         ORDER BY created_at DESC
@@ -782,6 +845,18 @@ elif page == "Steward Workbench":
         st.write(f"Dataset: `{selected_rule['dataset_name']}`")
         st.write(f"Column: `{selected_rule['column_name']}`")
         st.write(f"Status: `{selected_rule['status']}`")
+        st.write(
+            "Provenance: "
+            f"provider=`{selected_rule['llm_provider'] or 'system'}`, "
+            f"model=`{selected_rule['llm_model'] or 'n/a'}`, "
+            f"prompt=`{selected_rule['prompt_version'] or 'unknown'}`, "
+            f"generated=`{selected_rule['created_at']}`"
+        )
+        if selected_rule["decision_by"]:
+            st.write(
+                f"Last decision: `{selected_rule['decision_by']}` at "
+                f"`{selected_rule['decision_at']}`"
+            )
 
         st.json(selected_rule["rule_definition"])
 
@@ -789,29 +864,28 @@ elif page == "Steward Workbench":
 
         with col1:
             if st.button("Approve Rule"):
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("""
-                            UPDATE dq.rule
-                            SET status = 'approved'
-                            WHERE id = :id
-                        """),
-                        {"id": rule_id}
+                try:
+                    with engine.begin() as conn:
+                        canonical_type = approve_rule(
+                            conn, rule_id, steward_identity, decision_note
+                        )
+                    st.success(
+                        f"Rule {rule_id} approved as {canonical_type}."
                     )
-                st.success(f"Rule {rule_id} approved.")
+                except ValueError as exc:
+                    st.error(str(exc))
 
         with col2:
             if st.button("Reject Rule"):
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("""
-                            UPDATE dq.rule
-                            SET status = 'rejected'
-                            WHERE id = :id
-                        """),
-                        {"id": rule_id}
-                    )
-                st.warning(f"Rule {rule_id} rejected.")
+                try:
+                    with engine.begin() as conn:
+                        change_rule_status(
+                            conn, rule_id, "rejected",
+                            steward_identity, decision_note,
+                        )
+                    st.warning(f"Rule {rule_id} rejected.")
+                except ValueError as exc:
+                    st.error(str(exc))
                 
                 
 elif page == "Register Dataset":
@@ -1141,7 +1215,6 @@ elif page == "Dataset 360":
                     ON ru.id = r.rule_id
                 WHERE r.dataset_name = :dataset_name
                   AND ru.status = 'approved'
-                  AND r.result_status IN ('PASS', 'FAIL')
                 ORDER BY
                     r.rule_id,
                     r.checked_at DESC
@@ -1162,6 +1235,13 @@ elif page == "Dataset 360":
                         ELSE 0
                     END
                 ) AS failed_rules
+                ,SUM(
+                    CASE
+                        WHEN result_status = 'ERROR'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS error_rules
             FROM latest_results
             """,
             {
@@ -1190,6 +1270,11 @@ elif page == "Dataset 360":
                 0,
                 "failed_rules"
             ]
+            or 0
+        )
+
+        error_rules = int(
+            latest_quality_results.loc[0, "error_rules"]
             or 0
         )
 
@@ -1225,6 +1310,15 @@ elif page == "Dataset 360":
                 "have not been evaluated."
             )
             health_display = st.info
+
+        elif error_rules > 0:
+            health_label = "Evaluation Error"
+            health_icon = "🟠"
+            health_message = (
+                f"{error_rules} approved rule evaluation(s) failed. "
+                "Review the result details before trusting the quality score."
+            )
+            health_display = st.error
 
         elif quality_score >= 95:
             health_label = "Healthy"
@@ -1321,6 +1415,61 @@ elif page == "Dataset 360":
 
         st.divider()
 
+        st.subheader("Stewardship Run History")
+        stewardship_runs = read_sql(
+            """
+            SELECT stewardship_run_id, initiated_at, completed_at,
+                   initiated_by, status, error_message
+            FROM metadata.stewardship_run
+            WHERE dataset_name = :dataset_name
+            ORDER BY initiated_at DESC
+            LIMIT 25
+            """,
+            {"dataset_name": dataset_name},
+        )
+        st.dataframe(stewardship_runs, use_container_width=True)
+
+        if not stewardship_runs.empty:
+            selected_run_id = st.selectbox(
+                "Inspect stewardship run",
+                stewardship_runs["stewardship_run_id"].tolist(),
+            )
+            run_phases = read_sql(
+                """
+                SELECT phase_name, status, actor, started_at,
+                       completed_at, load_run_id, error_message
+                FROM metadata.stewardship_run_phase
+                WHERE stewardship_run_id = :run_id
+                ORDER BY phase_id
+                """,
+                {"run_id": int(selected_run_id)},
+            )
+            st.markdown(f"#### Run {selected_run_id} Phases")
+            st.dataframe(run_phases, use_container_width=True)
+
+            run_artifacts = read_sql(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM dq.rule
+                     WHERE stewardship_run_id = :run_id) AS rules_generated,
+                    (SELECT COUNT(*) FROM dq.result
+                     WHERE stewardship_run_id = :run_id) AS rule_results,
+                    (SELECT COUNT(*) FROM dq.failed_record fr
+                     INNER JOIN dq.result r ON r.id = fr.result_id
+                     WHERE r.stewardship_run_id = :run_id) AS failed_records,
+                    (SELECT COUNT(*) FROM dq.remediation_suggestion
+                     WHERE stewardship_run_id = :run_id) AS remediations
+                """,
+                {"run_id": int(selected_run_id)},
+            )
+            run_cols = st.columns(4)
+            run_cols[0].metric("Rules Generated", int(run_artifacts.loc[0, "rules_generated"]))
+            run_cols[1].metric("Rule Results", int(run_artifacts.loc[0, "rule_results"]))
+            run_cols[2].metric("Failed Records", int(run_artifacts.loc[0, "failed_records"]))
+            run_cols[3].metric("Remediations", int(run_artifacts.loc[0, "remediations"]))
+
+        st.divider()
+
         st.markdown("### Dataset Details")
         
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "Columns", "Rules", "Quality", "Remediation", "Raw vs Curated"])
@@ -1369,7 +1518,8 @@ elif page == "Dataset 360":
 
             st.subheader(f"Column: {selected_column}")
 
-            c1, c2, c3, c4 = st.columns(4)
+            error_runs = total_runs - passed_runs - failed_runs
+            c1, c2, c3, c4, c5 = st.columns(5)
 
             c1.metric("Type", col_profile["inferred_type"])
             c2.metric("Null %", round(float(col_profile["null_percent"]), 2))
@@ -1462,6 +1612,7 @@ elif page == "Dataset 360":
             c2.metric("Rule Runs", total_runs)
             c3.metric("Passed", passed_runs)
             c4.metric("Failed", failed_runs)
+            c5.metric("Errors", error_runs)
 
             st.progress(score / 100)
 
@@ -1547,28 +1698,51 @@ elif page == "Dataset 360":
        
 
     with tab6:
-        st.markdown("### Raw vs Curated Preview")
+        st.markdown("### Curated Version History")
 
         primary_key = dataset_row["primary_key"]
 
         if not primary_key:
             st.info("This dataset does not have a primary key configured.")
         else:
-            curated_exists = read_sql("""
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_schema = 'curated'
-                      AND table_name = :table_name
-                ) AS exists
-            """, {"table_name": dataset_row["raw_table"]})
+            versions = read_sql("""
+                SELECT curated_version_id, previous_version_id,
+                       remediation_run_id, stewardship_run_id,
+                       physical_table_name, created_by, created_at, row_count
+                FROM curated.dataset_version
+                WHERE dataset_name = :dataset_name AND status = 'completed'
+                ORDER BY curated_version_id DESC
+            """, {"dataset_name": dataset_name})
 
-            if not bool(curated_exists.loc[0, "exists"]):
-                st.info("No curated table exists yet. Apply approved remediations first.")
+            if versions.empty:
+                st.info("No curated version exists yet. Apply approved remediations first.")
             else:
+                st.dataframe(versions, use_container_width=True, hide_index=True)
+                version_ids = versions["curated_version_id"].astype(int).tolist()
+                selected_version = st.selectbox(
+                    "Inspect curated version",
+                    version_ids,
+                    format_func=lambda value: f"Version {value}",
+                )
+                version = versions.loc[
+                    versions["curated_version_id"] == selected_version
+                ].iloc[0]
+                physical_table = quote_identifier(version["physical_table_name"])
+                raw_schema = quote_identifier(dataset_row["raw_schema"])
+                raw_table = quote_identifier(dataset_row["raw_table"])
+                quoted_primary_key = quote_identifier(primary_key)
+                previous_version = (
+                    int(version["previous_version_id"])
+                    if pd.notna(version["previous_version_id"])
+                    else "none"
+                )
+                st.caption(
+                    f"Produced by remediation run {int(version['remediation_run_id'])}; "
+                    f"previous version: {previous_version}."
+                )
                 keys = read_sql(f"""
-                    SELECT "{primary_key}" AS key_value
-                    FROM {dataset_row["raw_schema"]}."{dataset_row["raw_table"]}"
+                    SELECT {quoted_primary_key} AS key_value
+                    FROM {raw_schema}.{raw_table}
                     LIMIT 100
                 """)
 
@@ -1579,15 +1753,15 @@ elif page == "Dataset 360":
 
                 raw_record = read_sql(f"""
                     SELECT *
-                    FROM {dataset_row["raw_schema"]}."{dataset_row["raw_table"]}"
-                    WHERE "{primary_key}" = :key_value
+                    FROM {raw_schema}.{raw_table}
+                    WHERE {quoted_primary_key} = :key_value
                     LIMIT 1
                 """, {"key_value": selected_key})
 
                 curated_record = read_sql(f"""
                     SELECT *
-                    FROM curated."{dataset_row["raw_table"]}"
-                    WHERE "{primary_key}" = :key_value
+                    FROM curated.{physical_table}
+                    WHERE {quoted_primary_key} = :key_value
                     LIMIT 1
                 """, {"key_value": selected_key})
 
@@ -1601,28 +1775,31 @@ elif page == "Dataset 360":
                     st.subheader("Curated")
                     st.dataframe(curated_record, use_container_width=True)
 
-                st.markdown("### Applied Remediations")
-
-                applied = read_sql("""
-                    SELECT
-                        id,
-                        issue_type,
-                        original_values,
-                        suggested_values,
-                        confidence_score,
-                        approved_by,
-                        approved_at
-                    FROM dq.remediation_suggestion
-                    WHERE dataset_name = :dataset_name
+                st.markdown("### Raw Row Lineage")
+                lineage = read_sql("""
+                    SELECT source_row_identifier, raw_load_run_id,
+                           source_file, created_at
+                    FROM curated.row_lineage
+                    WHERE curated_version_id = :version_id
                       AND source_row_identifier = :key_value
-                      AND status = 'applied'
-                    ORDER BY approved_at DESC
                 """, {
-                    "dataset_name": dataset_name,
+                    "version_id": selected_version,
                     "key_value": selected_key
                 })
+                st.dataframe(lineage, use_container_width=True, hide_index=True)
 
-                st.dataframe(applied, use_container_width=True)
+                st.markdown("### Changes in This Version")
+                changes = read_sql("""
+                    SELECT ch.change_id, ch.source_row_identifier,
+                           ch.column_name, ch.previous_value, ch.new_value,
+                           ch.remediation_id, ch.rule_id, r.rule_type,
+                           ch.result_id, ch.failed_record_id, ch.changed_at
+                    FROM curated.change_history ch
+                    JOIN dq.rule r ON r.id = ch.rule_id
+                    WHERE ch.curated_version_id = :version_id
+                    ORDER BY ch.change_id
+                """, {"version_id": selected_version})
+                st.dataframe(changes, use_container_width=True, hide_index=True)
         # st.write(f"**Dataset Name:** `{dataset_row['dataset_name']}`")
         # st.write(f"**Source Type:** `{dataset_row['source_type']}`")
         # st.write(f"**Parser:** `{dataset_row['parser_name']}`")
@@ -1642,6 +1819,11 @@ elif page == "Rule Catalog":
             rule_type,
             status,
             created_at,
+            llm_provider,
+            llm_model,
+            prompt_version,
+            decision_by,
+            decision_at,
             rule_definition
         FROM dq.rule
         ORDER BY created_at DESC
@@ -1655,68 +1837,76 @@ elif page == "Rule Catalog":
     new_status = st.selectbox("New Status", ["proposed", "approved", "rejected", "retired"])
 
     if st.button("Update Rule"):
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    UPDATE dq.rule
-                    SET status = :status
-                    WHERE id = :id
-                """),
-                {"status": new_status, "id": rule_id}
-            )
-        st.success(f"Rule {rule_id} updated to {new_status}")
+        try:
+            with engine.begin() as conn:
+                change_rule_status(
+                    conn, int(rule_id), new_status,
+                    steward_identity, decision_note,
+                )
+            st.success(f"Rule {rule_id} updated to {new_status}")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    rule_history = read_sql(
+        """
+        SELECT previous_status, new_status, changed_by, changed_at, decision_note
+        FROM dq.rule_audit
+        WHERE rule_id = :rule_id
+        ORDER BY changed_at DESC, id DESC
+        """,
+        {"rule_id": int(rule_id)},
+    )
+    st.subheader("Rule Decision History")
+    st.dataframe(rule_history, use_container_width=True)
 
 elif page == "Failed Records":
     st.header("Failed Records")
 
-    failed_rules = read_sql("""
+    failed_records = read_sql("""
         SELECT
-            r.id AS result_id,
-            r.checked_at,
-            r.dataset_name,
-            ru.id AS rule_id,
+            fr.id AS failed_record_id,
+            fr.result_id,
+            fr.created_at,
+            fr.dataset_name,
+            fr.source_row_identifier,
+            fr.rule_id,
             ru.column_name,
             ru.rule_type,
-            r.result_status,
-            r.failed_count,
-            r.details
-        FROM dq.result r
-        LEFT JOIN dq.rule ru ON r.rule_id = ru.id
-        WHERE r.result_status = 'FAIL'
-        ORDER BY r.checked_at DESC
+            r.checked_at
+        FROM dq.failed_record fr
+        INNER JOIN dq.result r ON r.id = fr.result_id
+        LEFT JOIN dq.rule ru ON ru.id = fr.rule_id
+        ORDER BY fr.created_at DESC, fr.id DESC
     """)
 
-    if failed_rules.empty:
-        st.success("No failed rule results found.")
+    if failed_records.empty:
+        st.success("No failed records found.")
     else:
-        st.dataframe(failed_rules, use_container_width=True)
+        st.dataframe(failed_records, use_container_width=True)
 
         result_id = st.selectbox(
             "Select failed result",
-            failed_rules["result_id"].tolist()
+            failed_records["result_id"].drop_duplicates().tolist()
         )
 
-        selected = failed_rules[failed_rules["result_id"] == result_id].iloc[0]
+        selected_records = failed_records[
+            failed_records["result_id"] == result_id
+        ]
+        selected = selected_records.iloc[0]
 
         st.subheader("Failure Summary")
         st.write(f"Dataset: `{selected['dataset_name']}`")
         st.write(f"Column: `{selected['column_name']}`")
-        st.write(f"Failed Records: `{selected['failed_count']}`")
+        st.write(f"Rule: `{selected['rule_id']}`")
+        st.write(f"Failed Records: `{len(selected_records)}`")
 
-        details = selected["details"]
-
-        if isinstance(details, str):
-            import json
-            details = json.loads(details)
-
-        sample_failures = details.get("sample_failures", [])
-
-        st.subheader("Sample Failed Records")
-
-        if sample_failures:
-            st.dataframe(pd.DataFrame(sample_failures), use_container_width=True)
-        else:
-            st.info("No sample failures stored for this result.")
+        st.subheader("All Failed Row Identifiers")
+        st.dataframe(
+            selected_records[
+                ["failed_record_id", "source_row_identifier", "created_at"]
+            ],
+            use_container_width=True,
+        )
 
 
 elif page == "Remediation Queue":
@@ -1730,19 +1920,37 @@ elif page == "Remediation Queue":
 
     if status_filter == "all":
         query = """
-            SELECT *
-            FROM dq.remediation_suggestion
-            ORDER BY created_at DESC
+            SELECT
+                remediation.*,
+                rule.rule_type AS originating_rule_type,
+                rule.column_name AS originating_column,
+                failed.source_row_identifier AS failed_row_identifier,
+                result.checked_at AS originating_evaluation_at
+            FROM dq.remediation_suggestion remediation
+            INNER JOIN dq.rule rule ON rule.id = remediation.rule_id
+            INNER JOIN dq.result result ON result.id = remediation.result_id
+            INNER JOIN dq.failed_record failed
+                ON failed.id = remediation.failed_record_id
+            ORDER BY remediation.created_at DESC
             LIMIT 100
         """
         remediations = read_sql(query)
 
     else:
         query = """
-            SELECT *
-            FROM dq.remediation_suggestion
-            WHERE status = :status
-            ORDER BY created_at DESC
+            SELECT
+                remediation.*,
+                rule.rule_type AS originating_rule_type,
+                rule.column_name AS originating_column,
+                failed.source_row_identifier AS failed_row_identifier,
+                result.checked_at AS originating_evaluation_at
+            FROM dq.remediation_suggestion remediation
+            INNER JOIN dq.rule rule ON rule.id = remediation.rule_id
+            INNER JOIN dq.result result ON result.id = remediation.result_id
+            INNER JOIN dq.failed_record failed
+                ON failed.id = remediation.failed_record_id
+            WHERE remediation.status = :status
+            ORDER BY remediation.created_at DESC
             LIMIT 100
         """
         remediations = read_sql(
@@ -1766,6 +1974,13 @@ elif page == "Remediation Queue":
             remediations["id"] == remediation_id
         ].iloc[0]
 
+        st.subheader("Originating Failure")
+        st.write(f"Rule: `{selected['rule_id']}` — `{selected['originating_rule_type']}`")
+        st.write(f"Result: `{selected['result_id']}`")
+        st.write(f"Failed record: `{selected['failed_record_id']}`")
+        st.write(f"Source row: `{selected['failed_row_identifier']}`")
+        st.write(f"Generation: `{selected['generation_method']}`")
+
         st.subheader("Original Values")
         st.json(selected["original_values"])
 
@@ -1783,41 +1998,41 @@ elif page == "Remediation Queue":
 
             if st.button("Approve Suggestion"):
 
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("""
-                            UPDATE dq.remediation_suggestion
-                            SET status = 'approved',
-                                approved_by = 'streamlit_user',
-                                approved_at = now()
-                            WHERE id = :id
-                        """),
-                        {"id": remediation_id}
-                    )
-
-                st.success(
-                    f"Remediation {remediation_id} approved."
-                )
+                try:
+                    with engine.begin() as conn:
+                        change_remediation_status(
+                            conn, remediation_id, "approved",
+                            steward_identity, decision_note,
+                        )
+                    st.success(f"Remediation {remediation_id} approved.")
+                except ValueError as exc:
+                    st.error(str(exc))
 
         with col2:
 
             if st.button("Reject Suggestion"):
 
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("""
-                            UPDATE dq.remediation_suggestion
-                            SET status = 'rejected',
-                                approved_by = 'streamlit_user',
-                                approved_at = now()
-                            WHERE id = :id
-                        """),
-                        {"id": remediation_id}
-                    )
+                try:
+                    with engine.begin() as conn:
+                        change_remediation_status(
+                            conn, remediation_id, "rejected",
+                            steward_identity, decision_note,
+                        )
+                    st.warning(f"Remediation {remediation_id} rejected.")
+                except ValueError as exc:
+                    st.error(str(exc))
 
-                st.warning(
-                    f"Remediation {remediation_id} rejected."
-                )
+        remediation_history = read_sql(
+            """
+            SELECT previous_status, new_status, changed_by, changed_at, decision_note
+            FROM dq.remediation_audit
+            WHERE remediation_id = :remediation_id
+            ORDER BY changed_at DESC, id DESC
+            """,
+            {"remediation_id": int(remediation_id)},
+        )
+        st.subheader("Remediation Decision History")
+        st.dataframe(remediation_history, use_container_width=True)
 
     else:
 
@@ -1838,7 +2053,7 @@ elif page == "Remediation Queue":
                 # text("""
                     # UPDATE dq.remediation_suggestion
                     # SET status = :status,
-                        # approved_by = 'streamlit_user',
+                        # approved_by = :steward_identity,
                         # approved_at = now()
                     # WHERE id = :id
                 # """),
@@ -2056,40 +2271,47 @@ elif page == "Run Pipeline":
         key="run_full_pipeline"
     ):
 
-        result = run_script(
-            "run_pipeline.py",
-            dataset_name
-        )
-
-        st.subheader(
-            "Pipeline Output"
-        )
-
-        st.code(
-            result.stdout
-        )
-
-        if result.stderr:
-
-            st.subheader(
-                "Errors / Warnings"
-            )
-
-            st.error(
-                result.stderr
-            )
-
-        if result.returncode == 0:
-
-            st.success(
-                "Pipeline completed successfully."
-            )
-
+        if not steward_identity:
+            st.error("Enter a steward identity before starting a full pipeline run.")
+            result = None
         else:
-
-            st.error(
-                "Pipeline failed."
+            result = run_script(
+                "run_pipeline.py",
+                dataset_name,
+                "--actor",
+                steward_identity,
             )
+
+        if result is not None:
+            st.subheader(
+                "Pipeline Output"
+            )
+
+            st.code(
+                result.stdout
+            )
+
+            if result.stderr:
+
+                st.subheader(
+                    "Errors / Warnings"
+                )
+
+                st.error(
+                    result.stderr
+                )
+
+            if result.returncode == 0:
+
+                st.success(
+                    "Pipeline completed successfully."
+                )
+
+            else:
+
+                st.error(
+                    "Pipeline failed."
+                )
 
     # =========================================================
     # EVALUATE APPROVED RULES
@@ -2191,11 +2413,19 @@ elif page == "Run Pipeline":
         "Apply Approved Remediations",
         key="apply_approved_remediations"
     ):
+        if not steward_identity:
+            st.error("Enter your steward identity before applying remediations.")
+            result = None
+        else:
+            result = run_script(
+                "apply_remediations.py",
+                dataset_name,
+                "--actor",
+                steward_identity,
+            )
 
-        result = run_script(
-            "apply_remediations.py",
-            dataset_name
-        )
+        if result is None:
+            st.stop()
 
         st.subheader(
             "Remediation Output"
